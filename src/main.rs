@@ -5,6 +5,12 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use fuzzy_matcher::skim::SkimMatcherV2;
+use lsp_types::{
+    CompletionParams, DidChangeTextDocumentParams, DidOpenTextDocumentParams, InitializeParams,
+    Position, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, VersionedTextDocumentIdentifier,
+};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use ratatui::{
     Frame, Terminal,
@@ -18,9 +24,10 @@ use ratatui::{
     },
 };
 use std::io::{Read, Write};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::thread;
+
 use std::{
     fs::{self, DirEntry, Metadata},
     io,
@@ -28,6 +35,9 @@ use std::{
     time::SystemTime,
 };
 use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
+use tokio::io::AsyncWriteExt;
+use tokio::process::{Child, ChildStdin, ChildStdout};
+use url::Url as UrlType;
 
 #[derive(Debug, Clone, Copy)]
 enum CursorDirection {
@@ -42,6 +52,227 @@ struct SearchMatch {
     line: usize,
     col: usize,
     text: String,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionCandidate {
+    label: String,
+    detail: Option<String>,
+    kind: Option<String>,
+    insert_text: Option<String>,
+}
+
+#[derive(Debug)]
+struct LspClient {
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    child: Option<Child>,
+    request_id: u64,
+    completions: Arc<Mutex<Vec<CompletionCandidate>>>,
+    initialized: bool,
+    status: LspStatus,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LspStatus {
+    NotStarted,
+    Starting,
+    Running,
+    Failed(String),
+    Stopped,
+}
+
+impl LspClient {
+    fn new() -> Self {
+        Self {
+            stdin: None,
+            stdout: None,
+            child: None,
+            request_id: 0,
+            completions: Arc::new(Mutex::new(Vec::new())),
+            initialized: false,
+            status: LspStatus::NotStarted,
+        }
+    }
+
+    async fn start_gopls(&mut self) -> AppResult<()> {
+        self.status = LspStatus::Starting;
+
+        // Check if gopls is available
+        match tokio::process::Command::new("which")
+            .arg("gopls")
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => {
+                // gopls found, proceed with starting it
+            }
+            _ => {
+                self.status = LspStatus::Failed("gopls not found in PATH".to_string());
+                return Err(anyhow::anyhow!(
+                    "gopls not found. Install with: go install golang.org/x/tools/gopls@latest"
+                ));
+            }
+        }
+
+        match tokio::process::Command::new("gopls")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                self.stdin = child.stdin.take();
+                self.stdout = child.stdout.take();
+                self.child = Some(child);
+
+                match self.initialize().await {
+                    Ok(_) => {
+                        self.status = LspStatus::Running;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        self.status = LspStatus::Failed(format!("Initialization failed: {}", e));
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => {
+                let error_msg = if e.kind() == std::io::ErrorKind::NotFound {
+                    "gopls command not found - install with: go install golang.org/x/tools/gopls@latest".to_string()
+                } else {
+                    format!("Failed to start gopls: {}", e)
+                };
+                self.status = LspStatus::Failed(error_msg.clone());
+                Err(anyhow::anyhow!(error_msg))
+            }
+        }
+    }
+
+    async fn initialize(&mut self) -> AppResult<()> {
+        let initialize_params = InitializeParams {
+            process_id: Some(std::process::id()),
+            root_path: None,
+            root_uri: None,
+            initialization_options: None,
+            capabilities: lsp_types::ClientCapabilities {
+                text_document: Some(lsp_types::TextDocumentClientCapabilities {
+                    completion: Some(lsp_types::CompletionClientCapabilities {
+                        completion_item: Some(lsp_types::CompletionItemCapability {
+                            snippet_support: Some(false),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            trace: None,
+            workspace_folders: None,
+            client_info: None,
+            locale: None,
+            work_done_progress_params: Default::default(),
+        };
+
+        self.send_request("initialize", initialize_params).await?;
+        self.send_notification("initialized", serde_json::json!({}))
+            .await?;
+        self.initialized = true;
+        Ok(())
+    }
+
+    async fn send_request<T: serde::Serialize>(
+        &mut self,
+        method: &str,
+        params: T,
+    ) -> AppResult<()> {
+        self.request_id += 1;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": self.request_id,
+            "method": method,
+            "params": params
+        });
+
+        self.send_message(&request.to_string()).await
+    }
+
+    async fn send_notification<T: serde::Serialize>(
+        &mut self,
+        method: &str,
+        params: T,
+    ) -> AppResult<()> {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        });
+
+        self.send_message(&notification.to_string()).await
+    }
+
+    async fn send_message(&mut self, message: &str) -> AppResult<()> {
+        if let Some(ref mut stdin) = self.stdin {
+            let content = format!("Content-Length: {}\r\n\r\n{}", message.len(), message);
+            stdin.write_all(content.as_bytes()).await?;
+            stdin.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn did_open(&mut self, uri: &str, language_id: &str, content: &str) -> AppResult<()> {
+        let params = DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: UrlType::parse(uri)?,
+                language_id: language_id.to_string(),
+                version: 1,
+                text: content.to_string(),
+            },
+        };
+
+        self.send_notification("textDocument/didOpen", params).await
+    }
+
+    async fn did_change(&mut self, uri: &str, version: i32, content: &str) -> AppResult<()> {
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: UrlType::parse(uri)?,
+                version,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: content.to_string(),
+            }],
+        };
+
+        self.send_notification("textDocument/didChange", params)
+            .await
+    }
+
+    async fn completion(&mut self, uri: &str, line: u32, character: u32) -> AppResult<()> {
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: UrlType::parse(uri)?,
+                },
+                position: Position { line, character },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+
+        self.send_request("textDocument/completion", params).await
+    }
+
+    fn is_go_file(path: &PathBuf) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_lowercase() == "go")
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Parser)]
@@ -171,7 +402,7 @@ struct App {
     cursor_line: usize,
     cursor_col: usize,
     cursor_blink_state: bool,
-    cursor_blink_timer: std::time::Instant,
+    cursor_blink_timer: usize,
     // Search functionality
     search_mode: bool,
     search_query: String,
@@ -185,8 +416,8 @@ struct App {
     file_finder_selected: usize,
     show_delete_confirmation: bool,
     file_to_delete: Option<PathBuf>,
-    // Multi-cursor
-    multi_cursors: Vec<(usize, usize)>, // (line, col) pairs
+    // Multi-cursor support
+    multi_cursors: Vec<(usize, usize)>,
     multi_cursor_mode: bool,
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
@@ -195,6 +426,19 @@ struct App {
     terminal_input: String,
     terminal_pty: Option<Box<dyn MasterPty + Send>>,
     terminal_receiver: Option<std::sync::mpsc::Receiver<String>>,
+    // LSP and autocomplete
+    lsp_client: Option<LspClient>,
+    show_completions: bool,
+    completions: Vec<CompletionCandidate>,
+    completion_selected: usize,
+    current_file_path: Option<PathBuf>,
+    current_file_version: i32,
+    fuzzy_matcher: SkimMatcherV2,
+    // LSP status display
+    show_lsp_status: bool,
+    lsp_status_message: String,
+    // Autocomplete debouncing
+    last_completion_trigger: std::time::Instant,
 }
 
 impl App {
@@ -204,7 +448,7 @@ impl App {
             current_path: path,
             selected_index: 0,
             list_state: ListState::default(),
-            scroll_state: ScrollbarState::new(0),
+            scroll_state: ScrollbarState::default(),
             show_hidden,
             human_readable,
             show_help: false,
@@ -218,8 +462,8 @@ impl App {
             cursor_position: 0,
             cursor_line: 0,
             cursor_col: 0,
-            cursor_blink_state: true,
-            cursor_blink_timer: std::time::Instant::now(),
+            cursor_blink_state: false,
+            cursor_blink_timer: 0,
             search_mode: false,
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -240,6 +484,16 @@ impl App {
             terminal_input: String::new(),
             terminal_pty: None,
             terminal_receiver: None,
+            lsp_client: None,
+            show_completions: false,
+            completions: Vec::new(),
+            completion_selected: 0,
+            current_file_path: None,
+            current_file_version: 1,
+            fuzzy_matcher: SkimMatcherV2::default(),
+            show_lsp_status: false,
+            lsp_status_message: String::new(),
+            last_completion_trigger: std::time::Instant::now(),
         };
         app.load_directory()?;
         app.list_state.select(Some(0));
@@ -329,8 +583,9 @@ impl App {
 
     fn open_file(&mut self) -> io::Result<()> {
         if let Some(selected_file) = self.files.get(self.selected_index) {
-            if !selected_file.is_dir && self.is_text_file(selected_file) {
-                match fs::read_to_string(&selected_file.path) {
+            if self.is_text_file(selected_file) {
+                let file_path = selected_file.path.clone();
+                match fs::read_to_string(&file_path) {
                     Ok(content) => {
                         self.file_content = content.clone();
                         self.original_file_content = content;
@@ -339,6 +594,12 @@ impl App {
                         self.file_editing_mode = false;
                         self.file_has_unsaved_changes = false;
                         self.update_cursor_position();
+
+                        // Initialize LSP for Go files
+                        if LspClient::is_go_file(&file_path) {
+                            let rt = tokio::runtime::Runtime::new().unwrap();
+                            let _ = rt.block_on(self.open_file_with_lsp(&file_path));
+                        }
                     }
                     Err(_) => {
                         // If file can't be read as text, do nothing
@@ -369,7 +630,7 @@ impl App {
         self.cursor_line = 0;
         self.cursor_col = 0;
         self.cursor_blink_state = true;
-        self.cursor_blink_timer = std::time::Instant::now();
+        self.cursor_blink_timer = 0;
         self.search_mode = false;
         self.search_query.clear();
         self.search_matches.clear();
@@ -467,13 +728,14 @@ impl App {
         self.cursor_line = 0;
         self.cursor_col = 0;
         self.cursor_blink_state = true;
-        self.cursor_blink_timer = std::time::Instant::now();
+        self.cursor_blink_timer = 0;
     }
 
     fn update_cursor_blink(&mut self) {
-        if self.cursor_blink_timer.elapsed().as_millis() > 500 {
+        self.cursor_blink_timer += 1;
+        if self.cursor_blink_timer >= 5 {
             self.cursor_blink_state = !self.cursor_blink_state;
-            self.cursor_blink_timer = std::time::Instant::now();
+            self.cursor_blink_timer = 0;
         }
     }
 
@@ -931,10 +1193,20 @@ impl App {
         if self.show_terminal {
             // Close terminal
             self.show_terminal = false;
-            self.terminal_pty = None;
+
+            // Clean up PTY resources
+            if let Some(pty) = self.terminal_pty.take() {
+                // Try to send exit command before closing
+                if let Ok(mut writer) = pty.take_writer() {
+                    let _ = writer.write_all(b"exit\n");
+                    let _ = writer.flush();
+                }
+            }
             self.terminal_receiver = None;
+
+            // Clear terminal state
             if let Ok(mut output) = self.terminal_output.lock() {
-                output.clear();
+                output.push_str("\n[Terminal closed]\n");
             }
             self.terminal_input.clear();
         } else {
@@ -945,26 +1217,37 @@ impl App {
     }
 
     fn open_terminal(&mut self) -> AppResult<()> {
+        // Clear any previous terminal output
+        if let Ok(mut output) = self.terminal_output.lock() {
+            output.clear();
+        }
+
         // Try to create pseudo-terminal, but don't fail the whole app if it doesn't work
         match self.try_create_pty() {
             Ok(_) => {
                 self.show_terminal = true;
                 if let Ok(mut output) = self.terminal_output.lock() {
-                    output.push_str("Terminal initialized successfully.\n");
+                    output.push_str("=== Terminal Started ===\n");
                     output.push_str(&format!(
                         "Working directory: {}\n",
                         self.current_path.display()
                     ));
+                    output.push_str("Type commands and press Enter. Ctrl+T to close.\n\n");
                 }
             }
             Err(e) => {
                 // Fallback to simple command execution
-                if let Ok(mut output) = self.terminal_output.lock() {
-                    output.push_str("Failed to create pseudo-terminal, using fallback mode.\n");
-                    output.push_str(&format!("Error: {}\n", e));
-                    output.push_str("You can still navigate files normally.\n");
-                }
                 self.show_terminal = true;
+                if let Ok(mut output) = self.terminal_output.lock() {
+                    output.push_str("=== Terminal (Fallback Mode) ===\n");
+                    output.push_str(&format!("Failed to create PTY: {}\n", e));
+                    output.push_str(&format!(
+                        "Working directory: {}\n",
+                        self.current_path.display()
+                    ));
+                    output.push_str("Commands will be echoed but not executed.\n");
+                    output.push_str("Use file browser features instead.\n\n");
+                }
             }
         }
         Ok(())
@@ -980,36 +1263,55 @@ impl App {
         };
 
         // Determine shell command
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "cmd.exe".to_string()
+            } else {
+                "/bin/sh".to_string()
+            }
+        });
         let mut cmd = CommandBuilder::new(&shell);
         cmd.cwd(&self.current_path);
 
         let pty_pair = pty_system.openpty(pty_size)?;
         let _child = pty_pair.slave.spawn_command(cmd)?;
 
-        // Setup reader thread
-        let mut reader = pty_pair.master.try_clone_reader()?;
+        // Setup reader thread with proper error handling
+        let reader = pty_pair.master.try_clone_reader()?;
         let terminal_output = Arc::clone(&self.terminal_output);
         let (sender, receiver) = mpsc::channel();
 
-        thread::spawn(move || {
+        std::thread::spawn(move || {
+            let mut reader = reader;
             let mut buffer = [0u8; 1024];
             loop {
                 match reader.read(&mut buffer) {
-                    Ok(0) => break, // EOF
+                    Ok(0) => {
+                        // EOF - terminal closed
+                        let _ = sender.send("\n[Terminal closed]\n".to_string());
+                        break;
+                    }
                     Ok(n) => {
                         let text = String::from_utf8_lossy(&buffer[..n]);
                         if let Ok(mut output) = terminal_output.lock() {
                             output.push_str(&text);
-                            // Keep only last 100 lines to prevent memory issues
-                            let lines: Vec<&str> = output.lines().collect();
-                            if lines.len() > 100 {
-                                *output = lines[lines.len() - 100..].join("\n");
+                            // Keep only last 1000 characters to prevent memory issues
+                            if output.len() > 5000 {
+                                let truncated =
+                                    output.chars().skip(output.len() - 1000).collect::<String>();
+                                *output = format!("...[truncated]...\n{}", truncated);
                             }
                         }
                         let _ = sender.send(text.to_string());
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        let error_msg = format!("\n[Terminal error: {}]\n", e);
+                        if let Ok(mut output) = terminal_output.lock() {
+                            output.push_str(&error_msg);
+                        }
+                        let _ = sender.send(error_msg);
+                        break;
+                    }
                 }
             }
         });
@@ -1021,16 +1323,22 @@ impl App {
     }
 
     fn send_to_terminal(&mut self, input: &str) -> AppResult<()> {
-        if let Some(ref pty) = self.terminal_pty {
+        if let Some(ref mut pty) = self.terminal_pty {
             match pty.take_writer() {
                 Ok(mut writer) => {
-                    let _ = writer.write_all(input.as_bytes());
-                    let _ = writer.flush();
+                    if let Err(e) = writer.write_all(input.as_bytes()) {
+                        // Terminal might be closed, add error to output
+                        if let Ok(mut output) = self.terminal_output.lock() {
+                            output.push_str(&format!("\n[Write error: {}]\n", e));
+                        }
+                    } else {
+                        let _ = writer.flush();
+                    }
                 }
-                Err(_) => {
-                    // Fallback: just echo the input to the output
+                Err(e) => {
+                    // Fallback: just echo the input to the output with error
                     if let Ok(mut output) = self.terminal_output.lock() {
-                        output.push_str(input);
+                        output.push_str(&format!("[Terminal unavailable: {}] {}", e, input));
                     }
                 }
             }
@@ -1048,20 +1356,298 @@ impl App {
         match ch {
             '\r' | '\n' => {
                 // Send the current input plus newline to terminal
-                let input = format!("{}\n", self.terminal_input);
-                let _ = self.send_to_terminal(&input);
+                let input = format!("{}\r\n", self.terminal_input);
+                self.send_to_terminal(&input)?;
+
+                // Echo the command to our output for visibility
+                if let Ok(mut output) = self.terminal_output.lock() {
+                    output.push_str(&format!("$ {}\n", self.terminal_input));
+                }
+
                 self.terminal_input.clear();
             }
             '\u{8}' | '\u{7f}' => {
                 // Backspace
                 if !self.terminal_input.is_empty() {
                     self.terminal_input.pop();
-                    let _ = self.send_to_terminal("\u{8} \u{8}"); // Backspace, space, backspace
+                    // Only send backspace to PTY if we have one
+                    if self.terminal_pty.is_some() {
+                        let _ = self.send_to_terminal("\u{8} \u{8}");
+                    }
+                }
+            }
+            '\u{3}' => {
+                // Ctrl+C - send interrupt signal
+                self.send_to_terminal("\u{3}")?;
+                self.terminal_input.clear();
+            }
+            '\u{4}' => {
+                // Ctrl+D - send EOF
+                self.send_to_terminal("\u{4}")?;
+            }
+            c if !c.is_control() => {
+                self.terminal_input.push(c);
+                // Only echo to PTY if we have one, otherwise just store locally
+                if self.terminal_pty.is_some() {
+                    let _ = self.send_to_terminal(&c.to_string());
                 }
             }
             _ => {
-                self.terminal_input.push(ch);
-                let _ = self.send_to_terminal(&ch.to_string());
+                // Ignore other control characters
+            }
+        }
+        Ok(())
+    }
+
+    async fn start_lsp_for_go(&mut self) -> AppResult<()> {
+        if self.lsp_client.is_none() {
+            self.lsp_status_message = "Starting Go language server...".to_string();
+            self.show_lsp_status = true;
+
+            let mut lsp = LspClient::new();
+            match lsp.start_gopls().await {
+                Ok(_) => {
+                    self.lsp_status_message =
+                        "✅ Go LSP ready - Ctrl+Space for autocomplete".to_string();
+                    self.lsp_client = Some(lsp);
+                    Ok(())
+                }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    if error_str.contains("not found") || error_str.contains("gopls") {
+                        self.lsp_status_message =
+                            "❌ gopls not found - Run: go install golang.org/x/tools/gopls@latest"
+                                .to_string();
+                    } else {
+                        self.lsp_status_message = format!("❌ Go LSP failed: {}", error_str);
+                    }
+                    Ok(())
+                }
+            }
+        } else {
+            if let Some(ref lsp) = self.lsp_client {
+                match lsp.status {
+                    LspStatus::Running => {
+                        self.lsp_status_message =
+                            "✅ Go LSP ready - Ctrl+Space for autocomplete".to_string();
+                    }
+                    LspStatus::Failed(ref err) => {
+                        self.lsp_status_message = format!("❌ Go LSP failed: {}", err);
+                    }
+                    _ => {
+                        self.lsp_status_message = "🔄 Go LSP starting...".to_string();
+                    }
+                }
+                self.show_lsp_status = true;
+            }
+            Ok(())
+        }
+    }
+
+    async fn open_file_with_lsp(&mut self, path: &PathBuf) -> AppResult<()> {
+        if LspClient::is_go_file(path) {
+            self.start_lsp_for_go().await?;
+
+            if let Some(ref mut lsp) = self.lsp_client {
+                let uri = format!("file://{}", path.to_string_lossy());
+                let content = &self.file_content;
+                lsp.did_open(&uri, "go", content).await?;
+                self.current_file_path = Some(path.clone());
+                self.current_file_version = 1;
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_file_with_lsp(&mut self) -> AppResult<()> {
+        if let (Some(lsp), Some(path)) = (&mut self.lsp_client, &self.current_file_path) {
+            if LspClient::is_go_file(path) {
+                let uri = format!("file://{}", path.to_string_lossy());
+                self.current_file_version += 1;
+                lsp.did_change(&uri, self.current_file_version, &self.file_content)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn request_completions(&mut self) -> AppResult<()> {
+        if let (Some(lsp), Some(path)) = (&mut self.lsp_client, &self.current_file_path) {
+            if LspClient::is_go_file(path) {
+                let uri = format!("file://{}", path.to_string_lossy());
+                lsp.completion(&uri, self.cursor_line as u32, self.cursor_col as u32)
+                    .await?;
+
+                // In a real implementation, you'd need to handle the LSP response
+                // For now, we'll add some context-aware mock completions
+                let lines: Vec<&str> = self.file_content.lines().collect();
+                let current_line = if self.cursor_line < lines.len() {
+                    lines[self.cursor_line]
+                } else {
+                    ""
+                };
+                let before_cursor = &current_line[..self.cursor_col.min(current_line.len())];
+
+                if let Ok(mut completions) = lsp.completions.lock() {
+                    completions.clear();
+
+                    // Context-specific completions
+                    if before_cursor.ends_with("fmt.") {
+                        completions.push(CompletionCandidate {
+                            label: "Println".to_string(),
+                            detail: Some("func(a ...interface{}) (n int, err error)".to_string()),
+                            kind: Some("Function".to_string()),
+                            insert_text: Some("Println(".to_string()),
+                        });
+                        completions.push(CompletionCandidate {
+                            label: "Printf".to_string(),
+                            detail: Some(
+                                "func(format string, a ...interface{}) (n int, err error)"
+                                    .to_string(),
+                            ),
+                            kind: Some("Function".to_string()),
+                            insert_text: Some("Printf(".to_string()),
+                        });
+                        completions.push(CompletionCandidate {
+                            label: "Sprintf".to_string(),
+                            detail: Some(
+                                "func(format string, a ...interface{}) string".to_string(),
+                            ),
+                            kind: Some("Function".to_string()),
+                            insert_text: Some("Sprintf(".to_string()),
+                        });
+                    } else if before_cursor.ends_with("strings.") {
+                        completions.push(CompletionCandidate {
+                            label: "ToLower".to_string(),
+                            detail: Some("func(s string) string".to_string()),
+                            kind: Some("Function".to_string()),
+                            insert_text: Some("ToLower(".to_string()),
+                        });
+                        completions.push(CompletionCandidate {
+                            label: "ToUpper".to_string(),
+                            detail: Some("func(s string) string".to_string()),
+                            kind: Some("Function".to_string()),
+                            insert_text: Some("ToUpper(".to_string()),
+                        });
+                        completions.push(CompletionCandidate {
+                            label: "Contains".to_string(),
+                            detail: Some("func(s, substr string) bool".to_string()),
+                            kind: Some("Function".to_string()),
+                            insert_text: Some("Contains(".to_string()),
+                        });
+                    } else {
+                        // General Go keywords and common patterns
+                        completions.push(CompletionCandidate {
+                            label: "func".to_string(),
+                            detail: Some("Function declaration".to_string()),
+                            kind: Some("Keyword".to_string()),
+                            insert_text: Some("func ".to_string()),
+                        });
+                        completions.push(CompletionCandidate {
+                            label: "if".to_string(),
+                            detail: Some("Conditional statement".to_string()),
+                            kind: Some("Keyword".to_string()),
+                            insert_text: Some("if ".to_string()),
+                        });
+                        completions.push(CompletionCandidate {
+                            label: "for".to_string(),
+                            detail: Some("Loop statement".to_string()),
+                            kind: Some("Keyword".to_string()),
+                            insert_text: Some("for ".to_string()),
+                        });
+                    }
+                }
+
+                self.completions = lsp.completions.lock().unwrap().clone();
+            }
+        }
+        Ok(())
+    }
+
+    fn show_autocomplete(&mut self) {
+        if !self.completions.is_empty() {
+            self.show_completions = true;
+            self.completion_selected = 0;
+        }
+    }
+
+    fn hide_autocomplete(&mut self) {
+        self.show_completions = false;
+        self.completions.clear();
+        self.completion_selected = 0;
+    }
+
+    fn select_completion(&mut self, direction: i32) {
+        if self.show_completions && !self.completions.is_empty() {
+            let new_index = (self.completion_selected as i32 + direction).max(0) as usize;
+            self.completion_selected = new_index.min(self.completions.len() - 1);
+        }
+    }
+
+    fn apply_completion(&mut self) {
+        if self.show_completions && self.completion_selected < self.completions.len() {
+            let completion = &self.completions[self.completion_selected];
+            let insert_text = completion.insert_text.as_ref().unwrap_or(&completion.label);
+
+            // Insert the completion text at cursor position
+            let lines: Vec<&str> = self.file_content.lines().collect();
+            if self.cursor_line < lines.len() {
+                let current_line = lines[self.cursor_line];
+                let before_cursor = &current_line[..self.cursor_col.min(current_line.len())];
+                let after_cursor = &current_line[self.cursor_col.min(current_line.len())..];
+
+                let new_line = format!("{}{}{}", before_cursor, insert_text, after_cursor);
+
+                let mut new_lines = lines.clone();
+                new_lines[self.cursor_line] = &new_line;
+                self.file_content = new_lines.join("\n");
+
+                self.cursor_col += insert_text.len();
+                self.file_has_unsaved_changes = true;
+
+                // Update LSP with changes
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let _ = rt.block_on(self.update_file_with_lsp());
+            }
+
+            self.hide_autocomplete();
+        }
+    }
+
+    async fn maybe_trigger_autocomplete(&mut self) -> AppResult<()> {
+        // Debounce autocomplete requests - only trigger if enough time has passed
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_completion_trigger).as_millis() < 200 {
+            return Ok(());
+        }
+
+        // Only trigger autocomplete if LSP is ready and we're in a Go file
+        if let (Some(lsp), Some(path)) = (&self.lsp_client, &self.current_file_path) {
+            if LspClient::is_go_file(path) && lsp.status == LspStatus::Running {
+                // Check if cursor is after a potential completion trigger
+                let lines: Vec<&str> = self.file_content.lines().collect();
+                if self.cursor_line < lines.len() {
+                    let current_line = lines[self.cursor_line];
+                    let before_cursor = &current_line[..self.cursor_col.min(current_line.len())];
+
+                    // Check for various completion triggers
+                    let should_trigger =
+                        // After a dot (package.function)
+                        before_cursor.ends_with('.') ||
+                        // After typing at least 2 characters of an identifier
+                        (before_cursor.len() >= 2 &&
+                         before_cursor.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').count() >= 2) ||
+                        // Inside function call context
+                        (before_cursor.contains('(') && !before_cursor.contains(')'));
+
+                    if should_trigger {
+                        self.last_completion_trigger = now;
+                        self.request_completions().await?;
+                        if !self.completions.is_empty() {
+                            self.show_autocomplete();
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -1131,8 +1717,36 @@ fn ui(f: &mut Frame, app: &mut App) {
             .split(size)
     };
 
-    // Header
-    let header = Paragraph::new(format!("📁 {}", app.current_path.display()))
+    // Header with LSP status for Go files
+    let header_text = if app.file_editing_mode {
+        if let Some(ref path) = app.current_file_path {
+            if LspClient::is_go_file(path) {
+                let lsp_indicator = if let Some(ref lsp) = app.lsp_client {
+                    match lsp.status {
+                        LspStatus::Running => "🟢 LSP",
+                        LspStatus::Starting => "🟡 LSP",
+                        LspStatus::Failed(_) => "🔴 LSP",
+                        _ => "⚪ LSP",
+                    }
+                } else {
+                    "⚪ LSP"
+                };
+                format!(
+                    "📁 {} | 🐹 Go {} Ready",
+                    app.current_path.display(),
+                    lsp_indicator
+                )
+            } else {
+                format!("📁 {}", app.current_path.display())
+            }
+        } else {
+            format!("📁 {}", app.current_path.display())
+        }
+    } else {
+        format!("📁 {}", app.current_path.display())
+    };
+
+    let header = Paragraph::new(header_text)
         .block(Block::default().borders(Borders::ALL))
         .style(Style::default().fg(Color::Cyan));
     f.render_widget(header, chunks[0]);
@@ -1192,40 +1806,91 @@ fn ui(f: &mut Frame, app: &mut App) {
             "Terminal output unavailable".to_string()
         };
 
-        // Show last 8 lines for bottom terminal
+        // Show last 10 lines for bottom terminal (increased from 8)
         let lines: Vec<&str> = terminal_content.lines().collect();
-        let visible_lines = if lines.len() > 8 {
-            &lines[lines.len() - 8..]
+        let visible_lines = if lines.len() > 10 {
+            &lines[lines.len() - 10..]
         } else {
-            &lines
+            &lines[..]
         };
 
-        let mut terminal_lines: Vec<Line> =
-            visible_lines.iter().map(|line| Line::from(*line)).collect();
+        let mut terminal_lines: Vec<Line> = visible_lines
+            .iter()
+            .map(|&line| {
+                // Color code different types of output
+                if line.starts_with("===") {
+                    Line::from(Span::styled(line, Style::default().fg(Color::Cyan)))
+                } else if line.starts_with("$") {
+                    Line::from(Span::styled(line, Style::default().fg(Color::Yellow)))
+                } else if line.contains("[error]") || line.contains("Error:") {
+                    Line::from(Span::styled(line, Style::default().fg(Color::Red)))
+                } else if line.starts_with("[") && line.contains("]") {
+                    Line::from(Span::styled(line, Style::default().fg(Color::Magenta)))
+                } else {
+                    Line::from(line)
+                }
+            })
+            .collect();
 
-        // Add current input line
-        let input_line = format!("$ {}", app.terminal_input);
-        terminal_lines.push(Line::from(input_line));
+        // Add current input line with cursor indicator
+        let cursor_indicator = if terminal_lines.len() % 2 == 0 {
+            "█"
+        } else {
+            " "
+        };
+        let input_line = format!("$ {}{}", app.terminal_input, cursor_indicator);
+        terminal_lines.push(Line::from(Span::styled(
+            input_line,
+            Style::default().fg(Color::Green),
+        )));
 
-        let terminal_widget = Paragraph::new(terminal_lines)
-            .block(
-                Block::default()
-                    .title(" Terminal (Ctrl+T to close) ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green)),
-            )
-            .wrap(Wrap { trim: false });
+        let terminal_title = if app.terminal_pty.is_some() {
+            "Terminal (Ctrl+T to close, Ctrl+C to interrupt)"
+        } else {
+            "Terminal - Fallback Mode (Ctrl+T to close)"
+        };
 
-        f.render_widget(terminal_widget, chunks[2]);
+        let terminal_paragraph = Paragraph::new(terminal_lines)
+            .block(Block::default().borders(Borders::ALL).title(terminal_title))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::White));
+
+        f.render_widget(terminal_paragraph, chunks[2]);
     }
 
     // Footer
     let footer_text = if app.show_help {
-        "Help: ↑↓/jk=Navigate  Enter=Open  a=Toggle hidden  h=Help  Ctrl+T=Terminal  q/Esc=Quit"
+        "Help: ↑↓/jk=Navigate  Enter=Open  a=Toggle hidden  h=Help  Ctrl+T=Terminal  q/Esc=Quit  Ctrl+Q=Force quit"
     } else if app.show_terminal {
-        "Terminal active - Type commands and press Enter  |  Ctrl+T to close  |  q to quit"
+        "Terminal active - Type commands and press Enter  |  Ctrl+T to close  |  Esc to quit  |  Ctrl+Q force quit"
+    } else if app.file_editing_mode
+        && app
+            .current_file_path
+            .as_ref()
+            .map(|p| LspClient::is_go_file(p))
+            .unwrap_or(false)
+    {
+        if app.show_lsp_status {
+            &app.lsp_status_message
+        } else if app.lsp_client.is_some() {
+            if let Some(ref lsp) = app.lsp_client {
+                match lsp.status {
+                    LspStatus::Running => {
+                        "Go file editing - 🟢 LSP ready - Ctrl+Space for autocomplete"
+                    }
+                    LspStatus::Failed(_) => {
+                        "Go file editing - 🔴 LSP failed - Press Ctrl+Space for details"
+                    }
+                    _ => "Go file editing - 🟡 LSP starting...",
+                }
+            } else {
+                "Go file editing - Press Ctrl+Space to start LSP"
+            }
+        } else {
+            "Go file editing - Press Ctrl+Space to start LSP"
+        }
     } else {
-        "Press 'h' for help  |  ↑↓ Navigate  Enter Open  Ctrl+T Terminal  q Quit"
+        "Press 'h' for help  |  ↑↓ Navigate  Enter Open  Ctrl+T Terminal  Esc Quit  Ctrl+Q Force quit"
     };
     let footer = Paragraph::new(footer_text)
         .block(Block::default().borders(Borders::ALL))
@@ -1255,6 +1920,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             Line::from("  h       - Toggle this help"),
             Line::from("  Ctrl+T  - Toggle integrated terminal"),
             Line::from("  q/Esc   - Quit or close popup"),
+            Line::from("  Ctrl+Q  - Force quit (bypasses all dialogs)"),
             Line::from(""),
             Line::from("File viewing and editing:"),
             Line::from("  Text files open with syntax highlighting"),
@@ -1263,6 +1929,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             Line::from("  View mode: ↑↓ to scroll"),
             Line::from("  Edit mode: ↑↓←→ to move cursor"),
             Line::from("  Edit mode: Type to insert, Tab for 4 spaces"),
+            Line::from("  Go files: Ctrl+Space for autocomplete, Tab to accept"),
             Line::from("  Edit mode: Backspace to delete, Ctrl+Z to revert"),
             Line::from("  Ctrl+F to search, F3/Shift+F3 for next/prev"),
             Line::from("  Ctrl+O for file finder, Ctrl+D for multi-cursor"),
@@ -1272,6 +1939,14 @@ fn ui(f: &mut Frame, app: &mut App) {
             Line::from("  Opens at bottom of screen"),
             Line::from("  Type commands and press Enter"),
             Line::from("  Ctrl+T to close terminal"),
+            Line::from(""),
+            Line::from("Go Language Server (LSP):"),
+            Line::from("  🟢 Green dot = LSP running and ready"),
+            Line::from("  🟡 Yellow dot = LSP starting up"),
+            Line::from("  🔴 Red dot = LSP failed or not installed"),
+            Line::from("  Install: go install golang.org/x/tools/gopls@latest"),
+            Line::from("  Ctrl+Space to trigger autocomplete"),
+            Line::from("  Tab to accept completion, Esc to close"),
         ];
         let help_popup = Paragraph::new(help_text)
             .block(
@@ -1655,6 +2330,73 @@ fn ui(f: &mut Frame, app: &mut App) {
             );
         }
 
+        // Show autocomplete popup if active
+        if app.show_completions && !app.completions.is_empty() {
+            let completion_area = ratatui::layout::Rect {
+                x: popup_area.x + 10,
+                y: popup_area.y + 5,
+                width: 40,
+                height: (app.completions.len() + 2).min(8) as u16,
+            };
+
+            f.render_widget(Clear, completion_area);
+
+            let completion_items: Vec<ListItem> = app
+                .completions
+                .iter()
+                .enumerate()
+                .map(|(i, completion)| {
+                    let style = if i == app.completion_selected {
+                        Style::default().bg(Color::Blue).fg(Color::White)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+
+                    let text = if let Some(ref detail) = completion.detail {
+                        format!("{} - {}", completion.label, detail)
+                    } else {
+                        completion.label.clone()
+                    };
+
+                    ListItem::new(text).style(style)
+                })
+                .collect();
+
+            let completion_list = List::new(completion_items).block(
+                Block::default()
+                    .title(" Autocomplete (Tab to insert, Esc to close) ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green)),
+            );
+
+            f.render_widget(completion_list, completion_area);
+        }
+
+        // Show LSP status notification if active
+        if app.show_lsp_status && app.file_editing_mode {
+            let status_area = ratatui::layout::Rect {
+                x: popup_area.x + 2,
+                y: popup_area.y + popup_area.height - 4,
+                width: popup_area.width - 4,
+                height: 1,
+            };
+
+            let status_color = if app.lsp_status_message.contains("✅") {
+                Color::Green
+            } else if app.lsp_status_message.contains("❌") {
+                Color::Red
+            } else {
+                Color::Yellow
+            };
+
+            f.render_widget(
+                Paragraph::new(app.lsp_status_message.clone())
+                    .style(Style::default().fg(status_color))
+                    .alignment(Alignment::Center),
+                status_area,
+            );
+        }
+
         let help_text = if app.search_mode {
             format!(
                 "SEARCH: '{}' | {} matches | F3/Shift+F3: next/prev | Esc: close search",
@@ -1879,11 +2621,19 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
         if poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
+                    KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Force exit - bypasses all modals and dialogs
+                        return Ok(());
+                    }
                     KeyCode::Char('q') | KeyCode::Esc => {
                         if app.show_delete_confirmation {
                             app.cancel_delete();
                         } else if app.show_unsaved_alert {
                             app.show_unsaved_alert = false;
+                        } else if app.show_completions {
+                            app.hide_autocomplete();
+                        } else if app.show_lsp_status {
+                            app.show_lsp_status = false;
                         } else if app.show_terminal {
                             app.toggle_terminal()?;
                         } else if app.show_file_content {
@@ -1894,7 +2644,13 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
                             return Ok(());
                         }
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
+                    KeyCode::Up if app.show_completions => {
+                        app.select_completion(-1);
+                    }
+                    KeyCode::Down if app.show_completions => {
+                        app.select_completion(1);
+                    }
+                    KeyCode::Up => {
                         if app.show_unsaved_alert {
                             // Don't navigate when alert is shown
                         } else if app.show_terminal {
@@ -1907,7 +2663,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
                             app.navigate_up();
                         }
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    KeyCode::Down => {
                         if app.show_unsaved_alert {
                             // Don't navigate when alert is shown
                         } else if app.show_terminal {
@@ -1917,6 +2673,48 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
                         } else if app.show_file_content && !app.file_editing_mode {
                             app.scroll_file_down();
                         } else if !app.show_help && !app.show_file_content {
+                            app.navigate_down();
+                        }
+                    }
+                    KeyCode::Char('k') => {
+                        if app.show_unsaved_alert {
+                            // Don't navigate when alert is shown
+                        } else if app.show_terminal {
+                            app.handle_terminal_input('k')?;
+                        } else if app.file_editing_mode {
+                            // In edit mode, 'k' should be typed as a character
+                            app.handle_file_edit('k');
+                            // Trigger autocomplete for Go files
+                            if let Some(ref path) = app.current_file_path.clone() {
+                                if LspClient::is_go_file(path) {
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    let _ = rt.block_on(app.update_file_with_lsp());
+                                    let _ = rt.block_on(app.maybe_trigger_autocomplete());
+                                }
+                            }
+                        } else if !app.show_help && !app.show_file_content {
+                            // Only use 'k' for navigation when not in edit mode
+                            app.navigate_up();
+                        }
+                    }
+                    KeyCode::Char('j') => {
+                        if app.show_unsaved_alert {
+                            // Don't navigate when alert is shown
+                        } else if app.show_terminal {
+                            app.handle_terminal_input('j')?;
+                        } else if app.file_editing_mode {
+                            // In edit mode, 'j' should be typed as a character
+                            app.handle_file_edit('j');
+                            // Trigger autocomplete for Go files
+                            if let Some(ref path) = app.current_file_path.clone() {
+                                if LspClient::is_go_file(path) {
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    let _ = rt.block_on(app.update_file_with_lsp());
+                                    let _ = rt.block_on(app.maybe_trigger_autocomplete());
+                                }
+                            }
+                        } else if !app.show_help && !app.show_file_content {
+                            // Only use 'j' for navigation when not in edit mode
                             app.navigate_down();
                         }
                     }
@@ -1988,6 +2786,58 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
                             app.toggle_terminal()?;
                         }
                     }
+                    KeyCode::Tab => {
+                        if app.show_completions {
+                            app.apply_completion();
+                        } else if app.file_editing_mode && !app.show_unsaved_alert {
+                            app.handle_file_edit('\t');
+                        }
+                    }
+                    KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.file_editing_mode && !app.show_unsaved_alert {
+                            if let Some(ref path) = app.current_file_path.clone() {
+                                if LspClient::is_go_file(path) {
+                                    // Show status and trigger autocomplete for Go files
+                                    if app.lsp_client.is_none() {
+                                        let rt = tokio::runtime::Runtime::new().unwrap();
+                                        let _ = rt.block_on(app.start_lsp_for_go());
+                                    }
+
+                                    if let Some(ref lsp) = app.lsp_client {
+                                        if lsp.status == LspStatus::Running {
+                                            let rt = tokio::runtime::Runtime::new().unwrap();
+                                            let _ = rt.block_on(app.request_completions());
+                                            app.show_autocomplete();
+                                        } else {
+                                            // Show current LSP status
+                                            match &lsp.status {
+                                                LspStatus::Failed(err) => {
+                                                    if err.contains("not found") {
+                                                        app.lsp_status_message = "❌ gopls not installed - Run: go install golang.org/x/tools/gopls@latest".to_string();
+                                                    } else {
+                                                        app.lsp_status_message =
+                                                            format!("❌ LSP Error: {}", err);
+                                                    }
+                                                }
+                                                LspStatus::Starting => {
+                                                    app.lsp_status_message =
+                                                        "🟡 Starting Go LSP server...".to_string();
+                                                }
+                                                _ => {
+                                                    app.lsp_status_message = "❌ Go LSP not ready - Check gopls installation".to_string();
+                                                }
+                                            }
+                                            app.show_lsp_status = true;
+                                        }
+                                    } else {
+                                        app.lsp_status_message =
+                                            "🟡 Starting Go LSP for first time...".to_string();
+                                        app.show_lsp_status = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     KeyCode::F(3) => {
                         if app.search_mode {
                             if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -2020,6 +2870,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
                         if app.show_unsaved_alert {
                             app.discard_changes();
                         } else if app.file_editing_mode {
+                            app.hide_autocomplete();
                             app.handle_file_edit('d');
                         }
                     }
@@ -2032,18 +2883,15 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
                             return Ok(());
                         }
                     }
+
                     KeyCode::Backspace => {
                         if app.show_unsaved_alert {
                             // Don't handle backspace when alert is shown
                         } else if app.show_terminal {
                             app.handle_terminal_input('\u{8}')?;
                         } else if app.file_editing_mode {
+                            app.hide_autocomplete();
                             app.handle_file_edit('\u{8}');
-                        }
-                    }
-                    KeyCode::Tab => {
-                        if app.file_editing_mode && !app.show_unsaved_alert {
-                            app.handle_file_edit('\t');
                         }
                     }
                     KeyCode::Char(c) => {
@@ -2109,7 +2957,29 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
                             {
                                 app.add_cursor_at_position();
                             } else {
+                                // Determine if this character should trigger or hide autocomplete
+                                let is_trigger_char = c == '.' || c.is_alphabetic() || c == '_';
+                                let is_completion_killer =
+                                    c.is_whitespace() || "(){}[];,".contains(c);
+
+                                if app.show_completions && is_completion_killer {
+                                    app.hide_autocomplete();
+                                }
+
                                 app.handle_file_edit(c);
+
+                                // Update LSP and trigger autocomplete for Go files
+                                if let Some(ref path) = app.current_file_path.clone() {
+                                    if LspClient::is_go_file(path) {
+                                        let rt = tokio::runtime::Runtime::new().unwrap();
+                                        let _ = rt.block_on(app.update_file_with_lsp());
+
+                                        // Auto-trigger autocomplete on trigger characters or when typing
+                                        if is_trigger_char || c.is_alphabetic() {
+                                            let _ = rt.block_on(app.maybe_trigger_autocomplete());
+                                        }
+                                    }
+                                }
                             }
                         }
                         // Don't handle other characters when not in terminal or edit mode

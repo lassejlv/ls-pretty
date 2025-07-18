@@ -18,6 +18,17 @@ A powerful Terminal User Interface (TUI) file browser with integrated text edito
 - **Unsaved changes protection** with smart alerts
 - **View/Edit mode toggle** for seamless workflow
 
+### 🚀 **Go Language Server & Autocomplete**
+- **Integrated Go LSP** with `gopls` language server support
+- **Automatic autocomplete** that triggers as you type in Go files
+- **Manual autocomplete** with Ctrl+Space for Go files
+- **Real-time completion suggestions** with function signatures
+- **Smart context-aware completions** from Go standard library
+- **Seamless LSP integration** that starts automatically for .go files
+- **Tab completion** to accept suggestions
+- **Visual completion popup** with detailed function information
+- **Fixed vim-style navigation** - 'k' and 'j' keys work properly in edit mode
+
 ### 💻 **Built-in Terminal**
 - **Integrated terminal** at bottom of screen (Ctrl+T)
 - **Real pseudo-terminal** with full shell support
@@ -37,6 +48,62 @@ A powerful Terminal User Interface (TUI) file browser with integrated text edito
 - **30+ line viewport** for better content visibility
 - **Vim-like controls** (hjkl) plus arrow keys
 
+## 📋 **Prerequisites**
+
+### For Go Language Server Support:
+```bash
+# Install Go language server (gopls)
+go install golang.org/x/tools/gopls@latest
+
+# Ensure gopls is in your PATH
+export PATH=$PATH:$(go env GOPATH)/bin
+
+# Verify installation
+gopls version
+```
+
+## 🔍 **How to Know if Go LSP is Working**
+
+### Visual Indicators:
+1. **Header Status**: When editing Go files, look for status in the header:
+   - `🟢 LSP` = Language server running and ready
+   - `🟡 LSP` = Language server starting up  
+   - `🔴 LSP` = Language server failed or not installed
+   - `⚪ LSP` = Language server not started
+
+2. **Footer Messages**: The footer shows current LSP status:
+   - `"🟢 LSP ready - Ctrl+Space for autocomplete"` = Working perfectly
+   - `"🔴 LSP failed - Press Ctrl+Space for details"` = Problem detected
+   - `"🟡 LSP starting..."` = Server initializing
+
+3. **Autocomplete Behavior**:
+   - **Working**: Press `Ctrl+Space` → Shows completion popup with Go functions
+   - **Not Working**: Press `Ctrl+Space` → Shows error message about installation
+
+### Troubleshooting Steps:
+```bash
+# 1. Check if gopls is installed
+which gopls
+
+# 2. If not found, install it
+go install golang.org/x/tools/gopls@latest
+
+# 3. Verify Go environment
+go env GOPATH
+go env GOROOT
+
+# 4. Make sure GOPATH/bin is in your PATH
+echo $PATH | grep "$(go env GOPATH)/bin"
+```
+
+### Test the Integration:
+1. Open the included `test.go` file
+2. Press `Enter` to view the file
+3. Press `Ctrl+E` to enter edit mode
+4. Look for LSP status indicators in header: `📁 /path | 🐹 Go 🟢 LSP Ready`
+5. Type `fmt.` and press `Ctrl+Space`
+6. You should see autocomplete suggestions with function signatures
+
 ## 🚀 Installation
 
 ```bash
@@ -48,6 +115,25 @@ cargo build --release
 ## 📖 Usage
 
 ### Interactive TUI Mode
+
+#### **Go Development Features:**
+```bash
+# Open a Go file for editing
+cargo run .
+# Navigate to a .go file and press Enter
+# Press Ctrl+E to enter edit mode
+# Press Ctrl+Space for autocomplete suggestions
+# Use ↑↓ to navigate completions, Tab to accept
+```
+
+#### **Go Autocomplete Demo:**
+1. Open the included `test.go` file
+2. Enter edit mode (Ctrl+E)  
+3. **Check LSP status** in header - should show `🟢 LSP`
+4. Type `fmt.` and press `Ctrl+Space`
+5. **If working**: See popup with `fmt.Println`, `fmt.Printf`, etc.
+6. **If not working**: See error message about gopls installation
+7. Navigate suggestions with ↑↓ arrows, press Tab to insert
 ```bash
 # Navigate current directory
 ./target/release/ls-pretty
@@ -99,6 +185,22 @@ cargo build --release
 | `Enter` | New line at cursor |
 | `Backspace` | Delete character before cursor |
 | `Esc` | Close file (with unsaved changes protection) |
+
+### Go Language Server (LSP) & Autocomplete
+| Key | Action |
+|-----|--------|
+| `Ctrl+Space` | Trigger autocomplete suggestions (Go files) |
+| `↑↓` | Navigate through autocomplete suggestions |
+| `Tab` | Accept selected autocomplete suggestion |
+| `Esc` | Close autocomplete popup or LSP status |
+| `Backspace` | Hide autocomplete and delete character |
+
+**LSP Status Indicators:**
+- **Header**: `📁 /path | 🐹 Go 🟢 LSP Ready` (shows current LSP state)
+- **Footer**: Dynamic messages about LSP status and capabilities
+- **🟢 Green**: LSP running and ready for autocomplete
+- **🟡 Yellow**: LSP starting up or initializing  
+- **🔴 Red**: LSP failed - check gopls installation
 
 ### File Finder
 | Key | Action |
