@@ -1,0 +1,61 @@
+Hello World!
+
+sssssssdasdas   This is a test file for demonstrating the editing functionality in ls-pretty.
+dsadasd
+
+dsadsa
+
+s
+dasdsa
+
+dasdas
+dasdsadsa
+
+
+dsadsadsa
+
+das
+🎯 Cursor & Editing Test File 🎯
+
+Welcome to the enhanced ls-pretty text editor!
+
+✨ NEW FEATURES TO TEST:
+1. Open this file and press 'E' to enter edit mode
+2. See the WHITE BLINKING CURSOR (█) - it blinks every 500ms!
+3. Use arrow keys (↑↓←→) to move the cursor around
+4. Type anywhere - text inserts at cursor position
+5. Press ENTER to create new lines at cursor
+6. Use BACKSPACE to delete characters before cursor
+7. Press Ctrl+S to save your changes
+8. Watch the status bar show cursor position (line:column)
+
+🔄 Try these cursor movements:
+- Move to different lines with ↑↓
+- Navigate within lines with ←→
+- Go to end of this line and press ENTER
+- Add some text here: [TYPE HERE]
+
+📏 The editor now shows 30+ lines at once!
+
+🚨 Unsaved changes protection:
+- Make some changes
+- Try to close with ESC
+- See the save/discard dialog
+
+Cursor position is shown in the status bar.
+Try moving around and watch it update!
+
+Test line 1 - move cursor here
+Test line 2 - try editing this
+Test line 3 - practice navigation
+
+Happy editing! 🎉
+ddsadsa
+
+dsa
+
+
+dasdas
+
+
+ssss
