@@ -9,7 +9,7 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use ratatui::{
     Frame, Terminal,
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout, Margin},
+    layout::{Alignment, Constraint, Direction, Layout, Margin},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -35,6 +35,13 @@ enum CursorDirection {
     Down,
     Left,
     Right,
+}
+
+#[derive(Debug, Clone)]
+struct SearchMatch {
+    line: usize,
+    col: usize,
+    text: String,
 }
 
 #[derive(Parser)]
@@ -165,6 +172,22 @@ struct App {
     cursor_col: usize,
     cursor_blink_state: bool,
     cursor_blink_timer: std::time::Instant,
+    // Search functionality
+    search_mode: bool,
+    search_query: String,
+    search_matches: Vec<SearchMatch>,
+    current_search_match: usize,
+    // File finder
+    file_finder_mode: bool,
+    file_finder_query: String,
+    file_finder_results: Vec<PathBuf>,
+    file_finder_all_files: Vec<PathBuf>,
+    file_finder_selected: usize,
+    show_delete_confirmation: bool,
+    file_to_delete: Option<PathBuf>,
+    // Multi-cursor
+    multi_cursors: Vec<(usize, usize)>, // (line, col) pairs
+    multi_cursor_mode: bool,
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
     show_terminal: bool,
@@ -197,6 +220,19 @@ impl App {
             cursor_col: 0,
             cursor_blink_state: true,
             cursor_blink_timer: std::time::Instant::now(),
+            search_mode: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            current_search_match: 0,
+            file_finder_mode: false,
+            file_finder_query: String::new(),
+            file_finder_results: Vec::new(),
+            file_finder_all_files: Vec::new(),
+            file_finder_selected: 0,
+            show_delete_confirmation: false,
+            file_to_delete: None,
+            multi_cursors: Vec::new(),
+            multi_cursor_mode: false,
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
             show_terminal: false,
@@ -334,6 +370,17 @@ impl App {
         self.cursor_col = 0;
         self.cursor_blink_state = true;
         self.cursor_blink_timer = std::time::Instant::now();
+        self.search_mode = false;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.current_search_match = 0;
+        self.file_finder_mode = false;
+        self.file_finder_query.clear();
+        self.file_finder_results.clear();
+        self.file_finder_all_files.clear();
+        self.file_finder_selected = 0;
+        self.multi_cursors.clear();
+        self.multi_cursor_mode = false;
     }
 
     fn toggle_edit_mode(&mut self) {
@@ -361,6 +408,14 @@ impl App {
                 self.cursor_position += 1;
                 self.cursor_line += 1;
                 self.cursor_col = 0;
+            }
+            '\t' => {
+                // Insert 4 spaces for tab
+                for _ in 0..4 {
+                    new_chars.insert(self.cursor_position, ' ');
+                    self.cursor_position += 1;
+                    self.cursor_col += 1;
+                }
             }
             '\u{8}' | '\u{7f}' => {
                 // Backspace
@@ -393,12 +448,18 @@ impl App {
         self.file_has_unsaved_changes = self.file_content != self.original_file_content;
 
         // Auto-scroll to keep cursor visible
-        let visible_lines = 30; // Show more lines
+        let visible_lines = 30;
+        let total_lines = self.file_content.lines().count();
+
         if self.cursor_line >= self.file_content_scroll + visible_lines {
             self.file_content_scroll = self.cursor_line.saturating_sub(visible_lines - 1);
         } else if self.cursor_line < self.file_content_scroll {
             self.file_content_scroll = self.cursor_line;
         }
+
+        // Ensure we don't scroll past the end of file
+        let max_scroll = total_lines.saturating_sub(visible_lines);
+        self.file_content_scroll = self.file_content_scroll.min(max_scroll);
     }
 
     fn update_cursor_position(&mut self) {
@@ -418,6 +479,7 @@ impl App {
 
     fn handle_cursor_movement(&mut self, direction: CursorDirection) {
         let lines: Vec<&str> = self.file_content.lines().collect();
+        let total_lines = lines.len();
 
         match direction {
             CursorDirection::Up => {
@@ -429,7 +491,6 @@ impl App {
                         0
                     };
                     self.cursor_col = self.cursor_col.min(line_len);
-                    self.recalculate_cursor_position();
                 }
             }
             CursorDirection::Down => {
@@ -441,7 +502,6 @@ impl App {
                         0
                     };
                     self.cursor_col = self.cursor_col.min(line_len);
-                    self.recalculate_cursor_position();
                 }
             }
             CursorDirection::Left => {
@@ -476,25 +536,43 @@ impl App {
             }
         }
 
+        // Recalculate cursor position for Up/Down movements
+        if matches!(direction, CursorDirection::Up | CursorDirection::Down) {
+            let mut pos = 0;
+            for i in 0..self.cursor_line.min(lines.len()) {
+                pos += lines[i].len() + 1; // +1 for newline
+            }
+            pos += self.cursor_col;
+            self.cursor_position = pos.min(self.file_content.len());
+        }
+
         // Auto-scroll to keep cursor visible
         let visible_lines = 30;
+
         if self.cursor_line >= self.file_content_scroll + visible_lines {
             self.file_content_scroll = self.cursor_line.saturating_sub(visible_lines - 1);
         } else if self.cursor_line < self.file_content_scroll {
             self.file_content_scroll = self.cursor_line;
         }
+
+        // Ensure we don't scroll past the end of file
+        let max_scroll = total_lines.saturating_sub(visible_lines);
+        self.file_content_scroll = self.file_content_scroll.min(max_scroll);
     }
 
-    fn recalculate_cursor_position(&mut self) {
-        let lines: Vec<&str> = self.file_content.lines().collect();
-        let mut pos = 0;
-
-        for i in 0..self.cursor_line.min(lines.len()) {
-            pos += lines[i].len() + 1; // +1 for newline
-        }
-        pos += self.cursor_col;
-
-        self.cursor_position = pos.min(self.file_content.len());
+    fn revert_changes(&mut self) {
+        self.file_content = self.original_file_content.clone();
+        self.file_has_unsaved_changes = false;
+        self.cursor_position = 0;
+        self.cursor_line = 0;
+        self.cursor_col = 0;
+        self.file_content_scroll = 0;
+        self.search_mode = false;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.current_search_match = 0;
+        self.multi_cursors.clear();
+        self.multi_cursor_mode = false;
     }
 
     fn discard_changes(&mut self) {
@@ -502,6 +580,273 @@ impl App {
         self.file_has_unsaved_changes = false;
         self.show_unsaved_alert = false;
         self.actually_close_file();
+    }
+
+    fn toggle_search(&mut self) {
+        self.search_mode = !self.search_mode;
+        if !self.search_mode {
+            self.search_query.clear();
+            self.search_matches.clear();
+            self.current_search_match = 0;
+        }
+    }
+
+    fn search_in_content(&mut self) {
+        self.search_matches.clear();
+        if self.search_query.is_empty() {
+            return;
+        }
+
+        let lines: Vec<&str> = self.file_content.lines().collect();
+        for (line_idx, line) in lines.iter().enumerate() {
+            let mut start = 0;
+            while let Some(pos) = line[start..].find(&self.search_query) {
+                self.search_matches.push(SearchMatch {
+                    line: line_idx,
+                    col: start + pos,
+                    text: self.search_query.clone(),
+                });
+                start += pos + 1;
+            }
+        }
+        self.current_search_match = 0;
+    }
+
+    fn next_search_match(&mut self) {
+        if !self.search_matches.is_empty() {
+            self.current_search_match = (self.current_search_match + 1) % self.search_matches.len();
+            let match_item = &self.search_matches[self.current_search_match];
+            self.cursor_line = match_item.line;
+            self.cursor_col = match_item.col;
+
+            // Auto-scroll to match
+            let visible_lines = 30;
+            if self.cursor_line >= self.file_content_scroll + visible_lines {
+                self.file_content_scroll = self.cursor_line.saturating_sub(visible_lines / 2);
+            } else if self.cursor_line < self.file_content_scroll {
+                self.file_content_scroll = self.cursor_line.saturating_sub(visible_lines / 2);
+            }
+        }
+    }
+
+    fn previous_search_match(&mut self) {
+        if !self.search_matches.is_empty() {
+            self.current_search_match = if self.current_search_match == 0 {
+                self.search_matches.len() - 1
+            } else {
+                self.current_search_match - 1
+            };
+            let match_item = &self.search_matches[self.current_search_match];
+            self.cursor_line = match_item.line;
+            self.cursor_col = match_item.col;
+
+            // Auto-scroll to match
+            let visible_lines = 30;
+            if self.cursor_line >= self.file_content_scroll + visible_lines {
+                self.file_content_scroll = self.cursor_line.saturating_sub(visible_lines / 2);
+            } else if self.cursor_line < self.file_content_scroll {
+                self.file_content_scroll = self.cursor_line.saturating_sub(visible_lines / 2);
+            }
+        }
+    }
+
+    fn toggle_file_finder(&mut self) {
+        self.file_finder_mode = !self.file_finder_mode;
+        if self.file_finder_mode {
+            if self.file_finder_all_files.is_empty() {
+                self.scan_files();
+            } else {
+                self.file_finder_results = self.file_finder_all_files.clone();
+            }
+        } else {
+            self.file_finder_query.clear();
+            self.file_finder_selected = 0;
+        }
+    }
+
+    fn scan_files(&mut self) {
+        self.file_finder_all_files.clear();
+        let current_path = self.current_path.clone();
+        self.scan_directory_recursive(&current_path);
+        self.file_finder_all_files.sort();
+        self.file_finder_results = self.file_finder_all_files.clone();
+        self.file_finder_selected = 0;
+    }
+
+    fn scan_directory_recursive(&mut self, dir: &PathBuf) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(file_name) = path.file_name() {
+                        if let Some(name_str) = file_name.to_str() {
+                            if !name_str.starts_with('.') {
+                                self.file_finder_all_files.push(path);
+                            }
+                        }
+                    }
+                } else if path.is_dir() {
+                    if let Some(dir_name) = path.file_name() {
+                        if let Some(name_str) = dir_name.to_str() {
+                            if !name_str.starts_with('.')
+                                && name_str != "target"
+                                && name_str != "node_modules"
+                            {
+                                self.scan_directory_recursive(&path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn filter_file_results(&mut self) {
+        if self.file_finder_query.is_empty() {
+            self.file_finder_results = self.file_finder_all_files.clone();
+            self.file_finder_selected = 0;
+            return;
+        }
+
+        let query = self.file_finder_query.to_lowercase();
+        self.file_finder_results = self
+            .file_finder_all_files
+            .iter()
+            .filter(|path| {
+                if let Some(file_name) = path.file_name() {
+                    if let Some(name_str) = file_name.to_str() {
+                        return name_str.to_lowercase().contains(&query);
+                    }
+                }
+                false
+            })
+            .cloned()
+            .collect();
+        self.file_finder_selected = 0;
+    }
+
+    fn open_selected_file(&mut self) -> AppResult<()> {
+        if self.file_finder_selected < self.file_finder_results.len() {
+            let file_path = &self.file_finder_results[self.file_finder_selected];
+            if self.is_text_file_path(file_path) {
+                match fs::read_to_string(file_path) {
+                    Ok(content) => {
+                        self.file_content = content.clone();
+                        self.original_file_content = content;
+                        self.show_file_content = true;
+                        self.file_content_scroll = 0;
+                        self.file_editing_mode = false;
+                        self.file_has_unsaved_changes = false;
+                        self.update_cursor_position();
+                        self.file_finder_mode = false;
+                        self.file_finder_query.clear();
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_text_file_path(&self, path: &PathBuf) -> bool {
+        if let Some(ext) = path.extension() {
+            if let Some(ext_str) = ext.to_str() {
+                return matches!(
+                    ext_str.to_lowercase().as_str(),
+                    "txt"
+                        | "md"
+                        | "rs"
+                        | "py"
+                        | "js"
+                        | "ts"
+                        | "html"
+                        | "css"
+                        | "json"
+                        | "xml"
+                        | "yaml"
+                        | "yml"
+                        | "toml"
+                        | "cfg"
+                        | "conf"
+                        | "log"
+                        | "sh"
+                        | "bash"
+                        | "zsh"
+                        | "fish"
+                        | "c"
+                        | "cpp"
+                        | "h"
+                        | "hpp"
+                        | "java"
+                        | "go"
+                        | "php"
+                        | "rb"
+                        | "pl"
+                        | "lua"
+                        | "vim"
+                        | "sql"
+                        | "csv"
+                );
+            }
+        }
+        false
+    }
+
+    fn toggle_multi_cursor(&mut self) {
+        self.multi_cursor_mode = !self.multi_cursor_mode;
+        if self.multi_cursor_mode {
+            // Add current cursor as first multi-cursor
+            if !self
+                .multi_cursors
+                .contains(&(self.cursor_line, self.cursor_col))
+            {
+                self.multi_cursors.push((self.cursor_line, self.cursor_col));
+            }
+        } else {
+            self.multi_cursors.clear();
+        }
+    }
+
+    fn confirm_delete_file(&mut self) {
+        if self.file_finder_selected < self.file_finder_results.len() {
+            let file_path = self.file_finder_results[self.file_finder_selected].clone();
+            self.file_to_delete = Some(file_path);
+            self.show_delete_confirmation = true;
+        }
+    }
+
+    fn delete_confirmed_file(&mut self) -> AppResult<()> {
+        if let Some(file_path) = &self.file_to_delete {
+            if file_path.exists() {
+                fs::remove_file(file_path)?;
+                // Remove from our cached lists
+                self.file_finder_all_files.retain(|p| p != file_path);
+                self.file_finder_results.retain(|p| p != file_path);
+                // Adjust selection if needed
+                if self.file_finder_selected >= self.file_finder_results.len()
+                    && self.file_finder_selected > 0
+                {
+                    self.file_finder_selected -= 1;
+                }
+            }
+        }
+        self.show_delete_confirmation = false;
+        self.file_to_delete = None;
+        Ok(())
+    }
+
+    fn cancel_delete(&mut self) {
+        self.show_delete_confirmation = false;
+        self.file_to_delete = None;
+    }
+
+    fn add_cursor_at_position(&mut self) {
+        if self.multi_cursor_mode {
+            let cursor_pos = (self.cursor_line, self.cursor_col);
+            if !self.multi_cursors.contains(&cursor_pos) {
+                self.multi_cursors.push(cursor_pos);
+            }
+        }
     }
 
     fn scroll_file_up(&mut self) {
@@ -512,7 +857,9 @@ impl App {
 
     fn scroll_file_down(&mut self) {
         let lines_count = self.file_content.lines().count();
-        if self.file_content_scroll < lines_count.saturating_sub(1) {
+        let max_visible = 30;
+        let max_scroll = lines_count.saturating_sub(max_visible);
+        if self.file_content_scroll < max_scroll {
             self.file_content_scroll += 1;
         }
     }
@@ -911,11 +1258,14 @@ fn ui(f: &mut Frame, app: &mut App) {
             Line::from(""),
             Line::from("File viewing and editing:"),
             Line::from("  Text files open with syntax highlighting"),
-            Line::from("  Press E to toggle edit mode"),
+            Line::from("  Press Ctrl+E to toggle edit mode"),
             Line::from("  Ctrl+S to save changes"),
             Line::from("  View mode: ↑↓ to scroll"),
             Line::from("  Edit mode: ↑↓←→ to move cursor"),
-            Line::from("  Edit mode: Type to insert, Backspace to delete"),
+            Line::from("  Edit mode: Type to insert, Tab for 4 spaces"),
+            Line::from("  Edit mode: Backspace to delete, Ctrl+Z to revert"),
+            Line::from("  Ctrl+F to search, F3/Shift+F3 for next/prev"),
+            Line::from("  Ctrl+O for file finder, Ctrl+D for multi-cursor"),
             Line::from("  Press Esc to close file view"),
             Line::from(""),
             Line::from("Terminal:"),
@@ -945,7 +1295,20 @@ fn ui(f: &mut Frame, app: &mut App) {
         let content = if app.file_editing_mode {
             // In editing mode, show syntax highlighted text with cursor and line numbers
             let content_lines: Vec<&str> = app.file_content.lines().collect();
-            let visible_lines = content_lines.iter().skip(app.file_content_scroll).take(30);
+            let total_lines = content_lines.len();
+            let max_visible = 30;
+
+            // Calculate actual lines to show (don't show excessive empty space)
+            let lines_to_show = if app.file_content_scroll + max_visible > total_lines {
+                total_lines.saturating_sub(app.file_content_scroll)
+            } else {
+                max_visible
+            };
+
+            let visible_lines = content_lines
+                .iter()
+                .skip(app.file_content_scroll)
+                .take(lines_to_show);
 
             // Prepare syntax highlighting for edit mode
             let selected_file = &app.files[app.selected_index];
@@ -982,7 +1345,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
                             for (style, text) in highlighted {
                                 let fg_color = style.foreground;
-                                let color = Color::Rgb(fg_color.r, fg_color.g, fg_color.b);
+                                let mut color = Color::Rgb(fg_color.r, fg_color.g, fg_color.b);
                                 let mut modifier = Modifier::empty();
                                 if style
                                     .font_style
@@ -1004,6 +1367,17 @@ fn ui(f: &mut Frame, app: &mut App) {
                                 }
 
                                 for ch in text.chars() {
+                                    // Check for search matches
+                                    let is_search_match = app.search_matches.iter().any(|m| {
+                                        m.line == actual_line_idx
+                                            && char_idx >= m.col
+                                            && char_idx < m.col + m.text.len()
+                                    });
+
+                                    if is_search_match {
+                                        color = Color::Black;
+                                    }
+
                                     if char_idx == app.cursor_col && app.cursor_blink_state {
                                         // Insert cursor before this character
                                         spans.push(Span::styled(
@@ -1011,12 +1385,27 @@ fn ui(f: &mut Frame, app: &mut App) {
                                             Style::default().fg(Color::White).bg(Color::DarkGray),
                                         ));
                                     }
+
+                                    // Check for multi-cursors
+                                    let is_multi_cursor =
+                                        app.multi_cursors.iter().any(|(line, col)| {
+                                            *line == actual_line_idx && *col == char_idx
+                                        });
+
+                                    let bg_color = if is_search_match {
+                                        Color::Yellow
+                                    } else if is_multi_cursor && app.cursor_blink_state {
+                                        Color::Blue
+                                    } else {
+                                        Color::DarkGray
+                                    };
+
                                     spans.push(Span::styled(
                                         ch.to_string(),
                                         Style::default()
                                             .fg(color)
                                             .add_modifier(modifier)
-                                            .bg(Color::DarkGray),
+                                            .bg(bg_color),
                                     ));
                                     char_idx += 1;
                                 }
@@ -1135,8 +1524,21 @@ fn ui(f: &mut Frame, app: &mut App) {
         } else {
             // In viewing mode, show syntax highlighted content with line numbers
             let content_lines: Vec<&str> = app.file_content.lines().collect();
-            let visible_lines = content_lines.iter().skip(app.file_content_scroll).take(30);
-            let line_number_width = (content_lines.len()).to_string().len().max(3);
+            let total_lines = content_lines.len();
+            let max_visible = 30;
+
+            // Calculate actual lines to show (don't show excessive empty space)
+            let lines_to_show = if app.file_content_scroll + max_visible > total_lines {
+                total_lines.saturating_sub(app.file_content_scroll)
+            } else {
+                max_visible
+            };
+
+            let visible_lines = content_lines
+                .iter()
+                .skip(app.file_content_scroll)
+                .take(lines_to_show);
+            let line_number_width = total_lines.to_string().len().max(3);
 
             let selected_file = &app.files[app.selected_index];
             let syntax = app
@@ -1212,35 +1614,88 @@ fn ui(f: &mut Frame, app: &mut App) {
 
         f.render_widget(content, popup_area);
 
-        // Show scroll indicator
+        // Show content indicators
         let total_lines = app.file_content.lines().count();
-        let help_text = if app.file_editing_mode {
-            if total_lines > 30 {
+        let max_visible = 30;
+        let lines_shown = if app.file_content_scroll + max_visible > total_lines {
+            total_lines.saturating_sub(app.file_content_scroll)
+        } else {
+            max_visible
+        };
+
+        // Show "more content above" indicator
+        if app.file_content_scroll > 0 {
+            let indicator_area = ratatui::layout::Rect {
+                x: popup_area.x + 1,
+                y: popup_area.y + 1,
+                width: popup_area.width - 2,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new("⬆ More content above ⬆")
+                    .style(Style::default().fg(Color::Yellow))
+                    .alignment(Alignment::Center),
+                indicator_area,
+            );
+        }
+
+        // Show "more content below" indicator
+        if app.file_content_scroll + lines_shown < total_lines {
+            let indicator_area = ratatui::layout::Rect {
+                x: popup_area.x + 1,
+                y: popup_area.y + popup_area.height - 3,
+                width: popup_area.width - 2,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new("⬇ More content below ⬇")
+                    .style(Style::default().fg(Color::Yellow))
+                    .alignment(Alignment::Center),
+                indicator_area,
+            );
+        }
+
+        let help_text = if app.search_mode {
+            format!(
+                "SEARCH: '{}' | {} matches | F3/Shift+F3: next/prev | Esc: close search",
+                app.search_query,
+                app.search_matches.len()
+            )
+        } else if app.file_editing_mode {
+            let multi_cursor_info = if app.multi_cursor_mode {
+                format!(" | {} cursors", app.multi_cursors.len())
+            } else {
+                String::new()
+            };
+
+            if total_lines > max_visible {
                 format!(
-                    "Lines {}-{} of {} | EDIT: Type/↑↓←→ navigate, Ctrl+S save, E view, Esc close | Cursor: {}:{}",
+                    "Lines {}-{} of {} | EDIT: Ctrl+F search, Ctrl+O finder, Ctrl+E view, Ctrl+D multi-cursor | Cursor: {}:{}{}",
                     app.file_content_scroll + 1,
-                    (app.file_content_scroll + 30).min(total_lines),
+                    app.file_content_scroll + lines_shown,
                     total_lines,
                     app.cursor_line + 1,
-                    app.cursor_col + 1
+                    app.cursor_col + 1,
+                    multi_cursor_info
                 )
             } else {
                 format!(
-                    "EDIT MODE: Type/↑↓←→ navigate, Ctrl+S save, E view, Esc close | Cursor: {}:{}",
+                    "EDIT MODE: Ctrl+F search, Ctrl+O finder, Ctrl+E view, Ctrl+D multi-cursor | Cursor: {}:{}{}",
                     app.cursor_line + 1,
-                    app.cursor_col + 1
+                    app.cursor_col + 1,
+                    multi_cursor_info
                 )
             }
         } else {
-            if total_lines > 30 {
+            if total_lines > max_visible {
                 format!(
-                    "Lines {}-{} of {} | VIEW MODE: ↑↓ to scroll, E to edit, Esc to close",
+                    "Lines {}-{} of {} | VIEW MODE: ↑↓ scroll, Ctrl+E edit, Ctrl+F search, Esc close",
                     app.file_content_scroll + 1,
-                    (app.file_content_scroll + 30).min(total_lines),
+                    app.file_content_scroll + lines_shown,
                     total_lines
                 )
             } else {
-                "VIEW MODE: E to edit, Esc to close".to_string()
+                "VIEW MODE: Ctrl+E edit, Ctrl+F search, Esc close".to_string()
             }
         };
 
@@ -1268,6 +1723,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             Line::from("Press:"),
             Line::from("  S - Save and close"),
             Line::from("  D - Discard changes and close"),
+            Line::from("  R - Revert to original and close"),
             Line::from("  C - Cancel (continue editing)"),
         ];
 
@@ -1281,6 +1737,110 @@ fn ui(f: &mut Frame, app: &mut App) {
             .style(Style::default().fg(Color::White));
 
         f.render_widget(alert, popup_area);
+    }
+
+    // Search mode overlay
+    if app.search_mode {
+        let search_area = ratatui::layout::Rect {
+            x: size.x + 2,
+            y: size.y + 2,
+            width: 50,
+            height: 3,
+        };
+        f.render_widget(Clear, search_area);
+
+        let search_input = Paragraph::new(format!("Search: {}", app.search_query)).block(
+            Block::default()
+                .title(" Find ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+        );
+        f.render_widget(search_input, search_area);
+    }
+
+    // File finder overlay
+    if app.file_finder_mode {
+        let finder_area = centered_rect(80, 60, size);
+        f.render_widget(Clear, finder_area);
+
+        let results: Vec<ListItem> = app
+            .file_finder_results
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                let relative_path = path
+                    .strip_prefix(&app.current_path)
+                    .unwrap_or(path)
+                    .to_string_lossy();
+
+                let style = if i == app.file_finder_selected {
+                    Style::default().bg(Color::Blue).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+
+                ListItem::new(format!("{} ({})", name, relative_path)).style(style)
+            })
+            .collect();
+
+        let finder_list = List::new(results).block(
+            Block::default()
+                .title(format!(" File Finder: {} ", app.file_finder_query))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+
+        f.render_widget(finder_list, finder_area);
+
+        let help_area = ratatui::layout::Rect {
+            x: finder_area.x + 2,
+            y: finder_area.y + finder_area.height - 2,
+            width: finder_area.width - 4,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(
+                "Type to filter, ↑↓ to navigate, Enter to open, Del to delete, Esc to close",
+            )
+            .style(Style::default().fg(Color::Gray)),
+            help_area,
+        );
+    }
+
+    // Delete confirmation dialog
+    if app.show_delete_confirmation {
+        let confirm_area = centered_rect(50, 25, size);
+        f.render_widget(Clear, confirm_area);
+
+        let file_name = app
+            .file_to_delete
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("Unknown");
+
+        let confirm_text = vec![
+            Line::from(""),
+            Line::from(format!("Delete file: {}", file_name)),
+            Line::from(""),
+            Line::from("This action cannot be undone!"),
+            Line::from(""),
+            Line::from("Press:"),
+            Line::from("  Y - Yes, delete file"),
+            Line::from("  N - No, cancel"),
+        ];
+
+        let confirm_dialog = Paragraph::new(confirm_text)
+            .block(
+                Block::default()
+                    .title(" Confirm Delete ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red)),
+            )
+            .style(Style::default().fg(Color::White));
+
+        f.render_widget(confirm_dialog, confirm_area);
     }
 }
 
@@ -1320,7 +1880,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
-                        if app.show_unsaved_alert {
+                        if app.show_delete_confirmation {
+                            app.cancel_delete();
+                        } else if app.show_unsaved_alert {
                             app.show_unsaved_alert = false;
                         } else if app.show_terminal {
                             app.toggle_terminal()?;
@@ -1405,9 +1967,34 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
                             app.toggle_help();
                         }
                     }
+                    KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.show_file_content && !app.show_unsaved_alert {
+                            app.toggle_search();
+                        }
+                    }
+                    KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if !app.show_unsaved_alert && !app.show_file_content {
+                            app.toggle_file_finder();
+                        }
+                    }
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.show_file_content && app.file_editing_mode && !app.show_unsaved_alert
+                        {
+                            app.toggle_multi_cursor();
+                        }
+                    }
                     KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if !app.show_unsaved_alert {
                             app.toggle_terminal()?;
+                        }
+                    }
+                    KeyCode::F(3) => {
+                        if app.search_mode {
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                app.previous_search_match();
+                            } else {
+                                app.next_search_match();
+                            }
                         }
                     }
                     KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1418,7 +2005,12 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
                             app.actually_close_file();
                         }
                     }
-                    KeyCode::Char('e') => {
+                    KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.show_file_content && app.file_editing_mode {
+                            app.revert_changes();
+                        }
+                    }
+                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if app.show_file_content && !app.show_unsaved_alert {
                             app.toggle_edit_mode();
                         }
@@ -1449,6 +2041,11 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
                             app.handle_file_edit('\u{8}');
                         }
                     }
+                    KeyCode::Tab => {
+                        if app.file_editing_mode && !app.show_unsaved_alert {
+                            app.handle_file_edit('\t');
+                        }
+                    }
                     KeyCode::Char(c) => {
                         if app.show_unsaved_alert {
                             match c {
@@ -1459,19 +2056,84 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
                                 'd' => {
                                     app.discard_changes();
                                 }
+                                'r' => {
+                                    app.revert_changes();
+                                    app.actually_close_file();
+                                }
                                 'c' => {
                                     app.show_unsaved_alert = false;
+                                }
+                                _ => {}
+                            }
+                        } else if app.search_mode {
+                            if c == '\n' || c == '\r' {
+                                app.search_in_content();
+                                if !app.search_matches.is_empty() {
+                                    app.next_search_match();
+                                }
+                            } else if c == '\u{8}' || c == '\u{7f}' {
+                                app.search_query.pop();
+                                app.search_in_content();
+                            } else if !c.is_control() {
+                                app.search_query.push(c);
+                                app.search_in_content();
+                            }
+                        } else if app.file_finder_mode {
+                            if c == '\n' || c == '\r' {
+                                app.open_selected_file()?;
+                            } else if c == '\u{8}' || c == '\u{7f}' {
+                                if !app.file_finder_query.is_empty() {
+                                    app.file_finder_query.pop();
+                                    app.filter_file_results();
+                                }
+                            } else if !c.is_control() {
+                                app.file_finder_query.push(c);
+                                app.filter_file_results();
+                            }
+                        } else if app.show_delete_confirmation {
+                            match c {
+                                'y' | 'Y' => {
+                                    app.delete_confirmed_file()?;
+                                }
+                                'n' | 'N' => {
+                                    app.cancel_delete();
                                 }
                                 _ => {}
                             }
                         } else if app.show_terminal {
                             app.handle_terminal_input(c)?;
                         } else if app.file_editing_mode {
-                            app.handle_file_edit(c);
+                            if c == '\n'
+                                && app.multi_cursor_mode
+                                && key.modifiers.contains(KeyModifiers::ALT)
+                            {
+                                app.add_cursor_at_position();
+                            } else {
+                                app.handle_file_edit(c);
+                            }
                         }
                         // Don't handle other characters when not in terminal or edit mode
                         // This prevents accidental exits
                     }
+                    // Handle file finder navigation
+                    _ if app.file_finder_mode => match key.code {
+                        KeyCode::Up => {
+                            if app.file_finder_selected > 0 {
+                                app.file_finder_selected -= 1;
+                            }
+                        }
+                        KeyCode::Down => {
+                            if app.file_finder_selected
+                                < app.file_finder_results.len().saturating_sub(1)
+                            {
+                                app.file_finder_selected += 1;
+                            }
+                        }
+                        KeyCode::Delete => {
+                            app.confirm_delete_file();
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
             }

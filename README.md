@@ -7,12 +7,13 @@ A powerful Terminal User Interface (TUI) file browser with integrated text edito
 ### 🎨 **Beautiful TUI Interface**
 - Interactive file browser with intuitive keyboard navigation
 - Elegant design with icons, colors, and visual feedback
-- Responsive layout with multiple display modes
-
+- Responsive layout with multiple dizzzzzzzzzzzzText Editor**
 ### 📝 **Integrated Text Editor**
 - **Syntax highlighting** for 20+ programming languages
 - **Real-time editing** with blinking cursor and line numbers
 - **Current line highlighting** with dark background
+- **Advanced search** with Ctrl+F and match highlighting
+- **Multi-cursor editing** for simultaneous edits
 - **Save functionality** with Ctrl+S
 - **Unsaved changes protection** with smart alerts
 - **View/Edit mode toggle** for seamless workflow
@@ -23,6 +24,11 @@ A powerful Terminal User Interface (TUI) file browser with integrated text edito
 - **Current directory context** - starts where you're browsing
 - **Command execution** with live output display
 - **Graceful fallback** if PTY unavailable
+
+### 🔍 **Advanced File Management**
+- **Recursive file finder** with Ctrl+O for instant navigation
+- **Smart file filtering** with real-time search
+- **Cross-directory file access** without leaving the interface
 
 ### 🎯 **Enhanced Navigation**
 - **Line numbers** in both view and edit modes
@@ -81,12 +87,27 @@ cargo build --release
 ### Text Editor
 | Key | Action |
 |-----|--------|
-| `E` | Toggle between view/edit modes |
+| `Ctrl+E` | Toggle between view/edit modes |
 | `↑↓←→` | Navigate cursor (edit) / scroll (view) |
+| `Tab` | Insert 4 spaces for indentation |
+| `Ctrl+F` | Open search mode |
+| `F3` / `Shift+F3` | Next/previous search match |
+| `Ctrl+D` | Toggle multi-cursor mode |
+| `Alt+Enter` | Add cursor at position (multi-cursor mode) |
 | `Ctrl+S` | Save file changes |
+| `Ctrl+Z` | Revert all changes to original |
 | `Enter` | New line at cursor |
 | `Backspace` | Delete character before cursor |
 | `Esc` | Close file (with unsaved changes protection) |
+
+### File Finder
+| Key | Action |
+|-----|--------|
+| `Ctrl+O` | Open recursive file finder |
+| `Type` | Filter files by name |
+| `↑↓` | Navigate through results |
+| `Enter` | Open selected file |
+| `Esc` | Close file finder |
 
 ### Terminal
 | Key | Action |
@@ -101,6 +122,7 @@ cargo build --release
 |-----|--------|
 | `S` | Save and close |
 | `D` | Discard changes and close |
+| `R` | Revert to original and close |
 | `C` | Cancel (continue editing) |
 
 ## 📂 File Type Support
@@ -143,6 +165,10 @@ cargo build --release
 - **Current line highlighting** with dark background
 - **Line numbers** with smart width calculation  
 - **Syntax highlighting** in both view and edit modes
+- **Advanced search** with match highlighting and navigation
+- **Multi-cursor editing** for simultaneous text manipulation
+- **Tab support** with 4-space indentation
+- **Revert functionality** with Ctrl+Z to undo all changes
 - **Real-time change tracking** with visual indicators
 - **Auto-scrolling** to keep cursor visible
 - **Cross-platform save** with Ctrl+S
@@ -154,6 +180,13 @@ cargo build --release
 - **Live command output** with scrollable history
 - **Background process support** with proper signal handling
 - **Robust error handling** with fallback modes
+
+### File Management Features
+- **Recursive file finder** scans entire project directory
+- **Smart filtering** with real-time search as you type
+- **Instant navigation** to any file without manual browsing
+- **Cross-directory access** from anywhere in the project
+- **Intelligent exclusions** (skips .git, target, node_modules)
 
 ### UI Enhancements
 - **30+ line display** for better productivity
@@ -209,19 +242,26 @@ anyhow = "1.0"            # Error handling
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Text Editor Mode
+### Text Editor with Advanced Features
 ```
 ┌ main.rs (EDITING - UNSAVED) ─────────────────────────────────────────────┐
 │  1 use std::collections::HashMap;                                        │
 │  2 use clap::Parser;                                                     │
 │  3                                                                       │
 │  4 fn main() {                                                           │
-│  5     println!("Hello, world!");█                                      │
-│  6 }                                                                     │
-│  7                                                                       │
+│  5     println!("Hello, world!");█    // <- Current cursor              │
+│  6     println!("Search this!");      // <- Highlighted search match    │
+│  7 }                                   // <- Multi-cursor position       │
 │  8                                                                       │
 └──────────────────────────────────────────────────────────────────────────┘
-│EDIT MODE: Type/↑↓←→ navigate, Ctrl+S save, E view, Esc close | Cursor: 5:27│
+│EDIT: Ctrl+F search, Ctrl+O finder, Ctrl+D multi-cursor | Cursor: 5:27│2 cursors│
+
+┌ File Finder: demo ───────────────────────────────────────────────────────┐
+│ demo.rs (src/demo.rs)                                                    │
+│ advanced_features_demo.rs (advanced_features_demo.rs)                   │
+│ test_file.txt (test_file.txt)                                           │
+└──────────────────────────────────────────────────────────────────────────┘
+│Type to filter, ↑↓ to navigate, Enter to open, Esc to close              │
 ```
 
 ## 🔮 Architecture
@@ -265,10 +305,14 @@ This project is open source. Feel free to use, modify, and distribute as needed.
 
 **ls-pretty** isn't just another file browser—it's a complete development environment in your terminal:
 
-✅ **All-in-one workflow**: Browse files, edit code, run commands—all without leaving the interface
-✅ **Professional editing**: Real syntax highlighting, cursor navigation, and save functionality  
-✅ **Terminal integration**: Execute commands in context with live output
-✅ **Beautiful design**: Carefully crafted UI with icons, colors, and smooth interactions
+✅ **All-in-one workflow**: Browse files, edit code, run commands—all without leaving the interface  
+✅ **Professional editing**: Real syntax highlighting, advanced search, multi-cursor support, and tab indentation  
+✅ **Instant navigation**: Recursive file finder lets you jump to any file instantly  
+✅ **Advanced search**: Find and navigate through code with highlighted matches  
+✅ **Multi-cursor magic**: Edit multiple locations simultaneously for powerful refactoring  
+✅ **Safe editing**: Revert changes with Ctrl+Z, unsaved changes protection with multiple options  
+✅ **Terminal integration**: Execute commands in context with live output  
+✅ **Beautiful design**: Carefully crafted UI with icons, colors, and smooth interactions  
 ✅ **Developer-focused**: Built by developers, for developers, with attention to workflow efficiency
 
 Whether you're exploring codebases, editing configuration files, or running quick commands, ls-pretty provides a seamless, productive experience that feels natural and powerful.
