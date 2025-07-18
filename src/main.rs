@@ -759,74 +759,6 @@ fn format_permissions(metadata: &Metadata) -> String {
     }
 }
 
-fn render_highlighted_content(app: &App) -> Vec<Line> {
-    if app.file_content.is_empty() {
-        return vec![Line::from("File is empty or could not be read")];
-    }
-
-    let selected_file = &app.files[app.selected_index];
-    let syntax = app
-        .syntax_set
-        .find_syntax_for_file(&selected_file.path)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| app.syntax_set.find_syntax_plain_text());
-
-    let theme = &app.theme_set.themes["base16-ocean.dark"];
-    let mut highlighter = HighlightLines::new(syntax, theme);
-
-    let mut lines = Vec::new();
-    let content_lines: Vec<&str> = app.file_content.lines().collect();
-
-    // Apply scrolling - show up to 20 lines at a time
-    let visible_lines = content_lines.iter().skip(app.file_content_scroll).take(20);
-
-    for line in visible_lines {
-        match highlighter.highlight_line(line, &app.syntax_set) {
-            Ok(highlighted) => {
-                let mut spans = Vec::new();
-                for (style, text) in highlighted {
-                    let fg_color = style.foreground;
-                    let color = Color::Rgb(fg_color.r, fg_color.g, fg_color.b);
-                    let mut modifier = Modifier::empty();
-                    if style
-                        .font_style
-                        .contains(syntect::highlighting::FontStyle::BOLD)
-                    {
-                        modifier |= Modifier::BOLD;
-                    }
-                    if style
-                        .font_style
-                        .contains(syntect::highlighting::FontStyle::ITALIC)
-                    {
-                        modifier |= Modifier::ITALIC;
-                    }
-                    if style
-                        .font_style
-                        .contains(syntect::highlighting::FontStyle::UNDERLINE)
-                    {
-                        modifier |= Modifier::UNDERLINED;
-                    }
-                    spans.push(Span::styled(
-                        text,
-                        Style::default().fg(color).add_modifier(modifier),
-                    ));
-                }
-                lines.push(Line::from(spans));
-            }
-            Err(_) => {
-                lines.push(Line::from(*line));
-            }
-        }
-    }
-
-    if lines.is_empty() {
-        lines.push(Line::from("No content to display"));
-    }
-
-    lines
-}
-
 fn ui(f: &mut Frame, app: &mut App) {
     let size = f.size();
 
@@ -1011,36 +943,175 @@ fn ui(f: &mut Frame, app: &mut App) {
         let title = format!(" {} ", selected_file.name);
 
         let content = if app.file_editing_mode {
-            // In editing mode, show raw text with cursor
+            // In editing mode, show syntax highlighted text with cursor and line numbers
             let content_lines: Vec<&str> = app.file_content.lines().collect();
             let visible_lines = content_lines.iter().skip(app.file_content_scroll).take(30);
 
+            // Prepare syntax highlighting for edit mode
+            let selected_file = &app.files[app.selected_index];
+            let syntax = app
+                .syntax_set
+                .find_syntax_for_file(&selected_file.path)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| app.syntax_set.find_syntax_plain_text());
+
+            let theme = &app.theme_set.themes["base16-ocean.dark"];
+            let mut highlighter = HighlightLines::new(syntax, theme);
+
             let mut lines: Vec<Line> = Vec::new();
+            let line_number_width = (content_lines.len()).to_string().len().max(3);
+
             for (line_idx, line_text) in visible_lines.enumerate() {
                 let actual_line_idx = line_idx + app.file_content_scroll;
+                let line_number = actual_line_idx + 1;
+
+                // Create line number span
+                let line_num_str = format!("{:width$} ", line_number, width = line_number_width);
+                let line_num_span =
+                    Span::styled(line_num_str, Style::default().fg(Color::DarkGray));
+
+                let mut spans = vec![line_num_span];
 
                 if actual_line_idx == app.cursor_line {
-                    // This line contains the cursor
-                    let mut spans = Vec::new();
-                    let line_chars: Vec<char> = line_text.chars().collect();
+                    // This line contains the cursor - highlight background and add syntax highlighting
+                    match highlighter.highlight_line(line_text, &app.syntax_set) {
+                        Ok(highlighted) => {
+                            let line_chars: Vec<char> = line_text.chars().collect();
+                            let mut char_idx = 0;
 
-                    for (col_idx, ch) in line_chars.iter().enumerate() {
-                        if col_idx == app.cursor_col && app.cursor_blink_state {
-                            // Insert cursor before this character
-                            spans.push(Span::styled("█", Style::default().fg(Color::White)));
+                            for (style, text) in highlighted {
+                                let fg_color = style.foreground;
+                                let color = Color::Rgb(fg_color.r, fg_color.g, fg_color.b);
+                                let mut modifier = Modifier::empty();
+                                if style
+                                    .font_style
+                                    .contains(syntect::highlighting::FontStyle::BOLD)
+                                {
+                                    modifier |= Modifier::BOLD;
+                                }
+                                if style
+                                    .font_style
+                                    .contains(syntect::highlighting::FontStyle::ITALIC)
+                                {
+                                    modifier |= Modifier::ITALIC;
+                                }
+                                if style
+                                    .font_style
+                                    .contains(syntect::highlighting::FontStyle::UNDERLINE)
+                                {
+                                    modifier |= Modifier::UNDERLINED;
+                                }
+
+                                for ch in text.chars() {
+                                    if char_idx == app.cursor_col && app.cursor_blink_state {
+                                        // Insert cursor before this character
+                                        spans.push(Span::styled(
+                                            "█",
+                                            Style::default().fg(Color::White).bg(Color::DarkGray),
+                                        ));
+                                    }
+                                    spans.push(Span::styled(
+                                        ch.to_string(),
+                                        Style::default()
+                                            .fg(color)
+                                            .add_modifier(modifier)
+                                            .bg(Color::DarkGray),
+                                    ));
+                                    char_idx += 1;
+                                }
+                            }
+
+                            // If cursor is at end of line
+                            if app.cursor_col >= line_chars.len() && app.cursor_blink_state {
+                                spans.push(Span::styled(
+                                    "█",
+                                    Style::default().fg(Color::White).bg(Color::DarkGray),
+                                ));
+                            }
+
+                            // Fill rest of line with background
+                            let remaining_width =
+                                80_usize.saturating_sub(line_text.len() + line_number_width + 1);
+                            if remaining_width > 0 {
+                                spans.push(Span::styled(
+                                    " ".repeat(remaining_width),
+                                    Style::default().bg(Color::DarkGray),
+                                ));
+                            }
                         }
-                        spans.push(Span::raw(ch.to_string()));
-                    }
+                        Err(_) => {
+                            // Fallback to raw text with cursor
+                            let line_chars: Vec<char> = line_text.chars().collect();
+                            for (col_idx, ch) in line_chars.iter().enumerate() {
+                                if col_idx == app.cursor_col && app.cursor_blink_state {
+                                    spans.push(Span::styled(
+                                        "█",
+                                        Style::default().fg(Color::White).bg(Color::DarkGray),
+                                    ));
+                                }
+                                spans.push(Span::styled(
+                                    ch.to_string(),
+                                    Style::default().bg(Color::DarkGray),
+                                ));
+                            }
 
-                    // If cursor is at end of line
-                    if app.cursor_col >= line_chars.len() && app.cursor_blink_state {
-                        spans.push(Span::styled("█", Style::default().fg(Color::White)));
-                    }
+                            if app.cursor_col >= line_chars.len() && app.cursor_blink_state {
+                                spans.push(Span::styled(
+                                    "█",
+                                    Style::default().fg(Color::White).bg(Color::DarkGray),
+                                ));
+                            }
 
-                    lines.push(Line::from(spans));
+                            let remaining_width =
+                                80_usize.saturating_sub(line_text.len() + line_number_width + 1);
+                            if remaining_width > 0 {
+                                spans.push(Span::styled(
+                                    " ".repeat(remaining_width),
+                                    Style::default().bg(Color::DarkGray),
+                                ));
+                            }
+                        }
+                    }
                 } else {
-                    lines.push(Line::from(*line_text));
+                    // Regular line with syntax highlighting
+                    match highlighter.highlight_line(line_text, &app.syntax_set) {
+                        Ok(highlighted) => {
+                            for (style, text) in highlighted {
+                                let fg_color = style.foreground;
+                                let color = Color::Rgb(fg_color.r, fg_color.g, fg_color.b);
+                                let mut modifier = Modifier::empty();
+                                if style
+                                    .font_style
+                                    .contains(syntect::highlighting::FontStyle::BOLD)
+                                {
+                                    modifier |= Modifier::BOLD;
+                                }
+                                if style
+                                    .font_style
+                                    .contains(syntect::highlighting::FontStyle::ITALIC)
+                                {
+                                    modifier |= Modifier::ITALIC;
+                                }
+                                if style
+                                    .font_style
+                                    .contains(syntect::highlighting::FontStyle::UNDERLINE)
+                                {
+                                    modifier |= Modifier::UNDERLINED;
+                                }
+                                spans.push(Span::styled(
+                                    text,
+                                    Style::default().fg(color).add_modifier(modifier),
+                                ));
+                            }
+                        }
+                        Err(_) => {
+                            spans.push(Span::raw(*line_text));
+                        }
+                    }
                 }
+
+                lines.push(Line::from(spans));
             }
 
             let edit_title = if app.file_has_unsaved_changes {
@@ -1062,9 +1133,74 @@ fn ui(f: &mut Frame, app: &mut App) {
                 )
                 .wrap(Wrap { trim: false })
         } else {
-            // In viewing mode, show syntax highlighted content
-            let highlighted_lines = render_highlighted_content(app);
-            Paragraph::new(highlighted_lines)
+            // In viewing mode, show syntax highlighted content with line numbers
+            let content_lines: Vec<&str> = app.file_content.lines().collect();
+            let visible_lines = content_lines.iter().skip(app.file_content_scroll).take(30);
+            let line_number_width = (content_lines.len()).to_string().len().max(3);
+
+            let selected_file = &app.files[app.selected_index];
+            let syntax = app
+                .syntax_set
+                .find_syntax_for_file(&selected_file.path)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| app.syntax_set.find_syntax_plain_text());
+
+            let theme = &app.theme_set.themes["base16-ocean.dark"];
+            let mut highlighter = HighlightLines::new(syntax, theme);
+
+            let mut lines: Vec<Line> = Vec::new();
+
+            for (line_idx, line_text) in visible_lines.enumerate() {
+                let actual_line_idx = line_idx + app.file_content_scroll;
+                let line_number = actual_line_idx + 1;
+
+                // Create line number span
+                let line_num_str = format!("{:width$} ", line_number, width = line_number_width);
+                let line_num_span =
+                    Span::styled(line_num_str, Style::default().fg(Color::DarkGray));
+
+                let mut spans = vec![line_num_span];
+
+                match highlighter.highlight_line(line_text, &app.syntax_set) {
+                    Ok(highlighted) => {
+                        for (style, text) in highlighted {
+                            let fg_color = style.foreground;
+                            let color = Color::Rgb(fg_color.r, fg_color.g, fg_color.b);
+                            let mut modifier = Modifier::empty();
+                            if style
+                                .font_style
+                                .contains(syntect::highlighting::FontStyle::BOLD)
+                            {
+                                modifier |= Modifier::BOLD;
+                            }
+                            if style
+                                .font_style
+                                .contains(syntect::highlighting::FontStyle::ITALIC)
+                            {
+                                modifier |= Modifier::ITALIC;
+                            }
+                            if style
+                                .font_style
+                                .contains(syntect::highlighting::FontStyle::UNDERLINE)
+                            {
+                                modifier |= Modifier::UNDERLINED;
+                            }
+                            spans.push(Span::styled(
+                                text,
+                                Style::default().fg(color).add_modifier(modifier),
+                            ));
+                        }
+                    }
+                    Err(_) => {
+                        spans.push(Span::raw(*line_text));
+                    }
+                }
+
+                lines.push(Line::from(spans));
+            }
+
+            Paragraph::new(lines)
                 .block(
                     Block::default()
                         .title(title)
