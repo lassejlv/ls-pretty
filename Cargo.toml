@@ -2,6 +2,12 @@
 name = "ls-pretty"
 version = "0.1.0"
 edition = "2024"
+default-run = "ls-pretty"
+
+[features]
+default = []
+tabs-demo = []
+
 
 [dependencies]
 ratatui = "0.24"

@@ -1,15 +1,7 @@
-mod tabs;
-
-#[cfg(feature = "tabs-demo")]
-mod tabs_demo;
-
 use anyhow::Result as AppResult;
 use clap::Parser;
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
-        MouseEventKind, poll,
-    },
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, poll},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -43,7 +35,6 @@ use std::{
     time::SystemTime,
 };
 use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
-use tabs::{Tab, TabManager};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use url::Url as UrlType;
@@ -407,11 +398,9 @@ struct App {
     file_has_unsaved_changes: bool,
     original_file_content: String,
     show_unsaved_alert: bool,
+    cursor_position: usize,
     cursor_line: usize,
     cursor_col: usize,
-    // Tab management
-    tab_manager: TabManager,
-    // Cursor display
     cursor_blink_state: bool,
     cursor_blink_timer: usize,
     // Search functionality
@@ -425,16 +414,6 @@ struct App {
     file_finder_results: Vec<PathBuf>,
     file_finder_all_files: Vec<PathBuf>,
     file_finder_selected: usize,
-    // Command palette
-    command_palette_mode: bool,
-    command_palette_query: String,
-    command_palette_results: Vec<String>,
-    command_palette_selected: usize,
-    // File tree modal
-    file_tree_mode: bool,
-    file_tree_expanded: Vec<PathBuf>,
-    file_tree_selected: usize,
-    file_tree_items: Vec<(PathBuf, bool, usize)>, // (path, is_dir, depth)
     show_delete_confirmation: bool,
     file_to_delete: Option<PathBuf>,
     // Multi-cursor support
@@ -452,16 +431,14 @@ struct App {
     show_completions: bool,
     completions: Vec<CompletionCandidate>,
     completion_selected: usize,
+    current_file_path: Option<PathBuf>,
+    current_file_version: i32,
     fuzzy_matcher: SkimMatcherV2,
     // LSP status display
     show_lsp_status: bool,
     lsp_status_message: String,
     // Autocomplete debouncing
     last_completion_trigger: std::time::Instant,
-
-    // Mouse click tracking for double-click detection
-    last_click_time: std::time::Instant,
-    last_click_position: (u16, u16),
 }
 
 impl App {
@@ -482,9 +459,9 @@ impl App {
             file_has_unsaved_changes: false,
             original_file_content: String::new(),
             show_unsaved_alert: false,
+            cursor_position: 0,
             cursor_line: 0,
             cursor_col: 0,
-            tab_manager: TabManager::new(),
             cursor_blink_state: false,
             cursor_blink_timer: 0,
             search_mode: false,
@@ -496,14 +473,6 @@ impl App {
             file_finder_results: Vec::new(),
             file_finder_all_files: Vec::new(),
             file_finder_selected: 0,
-            command_palette_mode: false,
-            command_palette_query: String::new(),
-            command_palette_results: Vec::new(),
-            command_palette_selected: 0,
-            file_tree_mode: false,
-            file_tree_expanded: Vec::new(),
-            file_tree_selected: 0,
-            file_tree_items: Vec::new(),
             show_delete_confirmation: false,
             file_to_delete: None,
             multi_cursors: Vec::new(),
@@ -519,20 +488,16 @@ impl App {
             show_completions: false,
             completions: Vec::new(),
             completion_selected: 0,
+            current_file_path: None,
+            current_file_version: 1,
             fuzzy_matcher: SkimMatcherV2::default(),
             show_lsp_status: false,
             lsp_status_message: String::new(),
             last_completion_trigger: std::time::Instant::now(),
-            last_click_time: std::time::Instant::now(),
-            last_click_position: (0, 0),
         };
         app.load_directory()?;
         app.list_state.select(Some(0));
         Ok(app)
-    }
-
-    fn refresh_files(&mut self) -> AppResult<()> {
-        self.load_directory().map_err(|e| anyhow::anyhow!(e))
     }
 
     fn load_directory(&mut self) -> io::Result<()> {
@@ -622,9 +587,13 @@ impl App {
                 let file_path = selected_file.path.clone();
                 match fs::read_to_string(&file_path) {
                     Ok(content) => {
-                        let file_name = selected_file.name.clone();
-                        self.tab_manager
-                            .add_tab(file_name, file_path.clone(), content);
+                        self.file_content = content.clone();
+                        self.original_file_content = content;
+                        self.show_file_content = true;
+                        self.file_content_scroll = 0;
+                        self.file_editing_mode = false;
+                        self.file_has_unsaved_changes = false;
+                        self.update_cursor_position();
 
                         // Initialize LSP for Go files
                         if LspClient::is_go_file(&file_path) {
@@ -642,17 +611,24 @@ impl App {
     }
 
     fn close_file(&mut self) {
-        if self.tab_manager.has_tabs() {
-            let _ = self.tab_manager.close_active_tab();
+        if self.file_has_unsaved_changes {
+            self.show_unsaved_alert = true;
+        } else {
+            self.actually_close_file();
         }
     }
 
     fn actually_close_file(&mut self) {
-        // This method is now handled by TabManager
-        if let Some(index) = self.tab_manager.tab_to_close {
-            self.tab_manager.confirm_close_tab();
-        }
-        // Cursor position is now managed by individual tabs
+        self.show_file_content = false;
+        self.file_content.clear();
+        self.file_content_scroll = 0;
+        self.file_editing_mode = false;
+        self.file_has_unsaved_changes = false;
+        self.original_file_content.clear();
+        self.show_unsaved_alert = false;
+        self.cursor_position = 0;
+        self.cursor_line = 0;
+        self.cursor_col = 0;
         self.cursor_blink_state = true;
         self.cursor_blink_timer = 0;
         self.search_mode = false;
@@ -664,113 +640,93 @@ impl App {
         self.file_finder_results.clear();
         self.file_finder_all_files.clear();
         self.file_finder_selected = 0;
-        self.command_palette_mode = false;
-        self.command_palette_query.clear();
-        self.command_palette_results.clear();
-        self.command_palette_selected = 0;
-        self.file_tree_mode = false;
-        self.file_tree_expanded.clear();
-        self.file_tree_selected = 0;
-        self.file_tree_items.clear();
         self.multi_cursors.clear();
         self.multi_cursor_mode = false;
     }
 
     fn toggle_edit_mode(&mut self) {
-        // Edit mode is now determined by whether we have tabs open
-        // Individual tab editing state could be added to Tab struct if needed
+        self.file_editing_mode = !self.file_editing_mode;
     }
 
     fn save_file(&mut self) -> AppResult<()> {
-        if let Some(tab) = self.tab_manager.get_active_tab() {
-            if tab.has_unsaved_changes {
-                fs::write(&tab.path, &tab.content)?;
-                self.tab_manager
-                    .save_active_tab()
-                    .map_err(|e| anyhow::anyhow!(e))?;
+        if let Some(selected_file) = self.files.get(self.selected_index) {
+            if !selected_file.is_dir && self.file_has_unsaved_changes {
+                fs::write(&selected_file.path, &self.file_content)?;
+                self.original_file_content = self.file_content.clone();
+                self.file_has_unsaved_changes = false;
             }
         }
         Ok(())
     }
 
     fn handle_file_edit(&mut self, ch: char) {
-        if let Some(tab) = self.tab_manager.get_active_tab_mut() {
-            let chars: Vec<char> = tab.content.chars().collect();
-            let mut new_chars = chars.clone();
-            let cursor_position = Self::get_cursor_position_from_tab(tab);
+        let chars: Vec<char> = self.file_content.chars().collect();
+        let mut new_chars = chars.clone();
 
-            match ch {
-                '\n' => {
-                    new_chars.insert(cursor_position, '\n');
-                    tab.cursor_line += 1;
-                    tab.cursor_col = 0;
+        match ch {
+            '\n' => {
+                new_chars.insert(self.cursor_position, '\n');
+                self.cursor_position += 1;
+                self.cursor_line += 1;
+                self.cursor_col = 0;
+            }
+            '\t' => {
+                // Insert 4 spaces for tab
+                for _ in 0..4 {
+                    new_chars.insert(self.cursor_position, ' ');
+                    self.cursor_position += 1;
+                    self.cursor_col += 1;
                 }
-                '\t' => {
-                    // Insert 4 spaces for tab
-                    for i in 0..4 {
-                        new_chars.insert(cursor_position + i, ' ');
-                    }
-                    tab.cursor_col += 4;
-                }
-                '\u{8}' | '\u{7f}' => {
-                    // Backspace
-                    if cursor_position > 0 {
-                        new_chars.remove(cursor_position - 1);
-                        if tab.cursor_col > 0 {
-                            tab.cursor_col -= 1;
-                        } else if tab.cursor_line > 0 {
-                            tab.cursor_line -= 1;
-                            // Find the length of the previous line
-                            let lines: Vec<&str> = tab.content.lines().collect();
-                            if tab.cursor_line < lines.len() {
-                                tab.cursor_col = lines[tab.cursor_line].len();
-                            }
+            }
+            '\u{8}' | '\u{7f}' => {
+                // Backspace
+                if self.cursor_position > 0 {
+                    new_chars.remove(self.cursor_position - 1);
+                    self.cursor_position -= 1;
+                    if self.cursor_col > 0 {
+                        self.cursor_col -= 1;
+                    } else if self.cursor_line > 0 {
+                        self.cursor_line -= 1;
+                        // Find the length of the previous line
+                        let lines: Vec<&str> = self.file_content.lines().collect();
+                        if self.cursor_line < lines.len() {
+                            self.cursor_col = lines[self.cursor_line].len();
                         }
                     }
                 }
-                c if c.is_control() => {
-                    // Ignore other control characters
-                }
-                _ => {
-                    new_chars.insert(cursor_position, ch);
-                    tab.cursor_col += 1;
-                }
             }
-
-            tab.content = new_chars.into_iter().collect();
-            tab.mark_dirty();
-
-            // Auto-scroll to keep cursor visible
-            let visible_lines = 30;
-            let total_lines = tab.content.lines().count();
-
-            if tab.cursor_line >= tab.scroll_offset + visible_lines {
-                tab.scroll_offset = tab.cursor_line.saturating_sub(visible_lines - 1);
-            } else if tab.cursor_line < tab.scroll_offset {
-                tab.scroll_offset = tab.cursor_line;
+            c if c.is_control() => {
+                // Ignore other control characters
             }
-
-            // Ensure we don't scroll past the end of file
-            let max_scroll = total_lines.saturating_sub(visible_lines);
-            tab.scroll_offset = tab.scroll_offset.min(max_scroll);
-        }
-    }
-
-    fn get_cursor_position_from_tab(tab: &Tab) -> usize {
-        let lines: Vec<&str> = tab.content.lines().collect();
-        let mut position = 0;
-        for (i, line) in lines.iter().enumerate() {
-            if i < tab.cursor_line {
-                position += line.len() + 1; // +1 for newline
-            } else if i == tab.cursor_line {
-                position += tab.cursor_col;
-                break;
+            _ => {
+                new_chars.insert(self.cursor_position, ch);
+                self.cursor_position += 1;
+                self.cursor_col += 1;
             }
         }
-        position
+
+        self.file_content = new_chars.into_iter().collect();
+        self.file_has_unsaved_changes = self.file_content != self.original_file_content;
+
+        // Auto-scroll to keep cursor visible
+        let visible_lines = 30;
+        let total_lines = self.file_content.lines().count();
+
+        if self.cursor_line >= self.file_content_scroll + visible_lines {
+            self.file_content_scroll = self.cursor_line.saturating_sub(visible_lines - 1);
+        } else if self.cursor_line < self.file_content_scroll {
+            self.file_content_scroll = self.cursor_line;
+        }
+
+        // Ensure we don't scroll past the end of file
+        let max_scroll = total_lines.saturating_sub(visible_lines);
+        self.file_content_scroll = self.file_content_scroll.min(max_scroll);
     }
 
     fn update_cursor_position(&mut self) {
+        self.cursor_position = 0;
+        self.cursor_line = 0;
+        self.cursor_col = 0;
         self.cursor_blink_state = true;
         self.cursor_blink_timer = 0;
     }
@@ -784,84 +740,95 @@ impl App {
     }
 
     fn handle_cursor_movement(&mut self, direction: CursorDirection) {
-        if !self.tab_manager.has_tabs() {
-            return;
-        }
+        let lines: Vec<&str> = self.file_content.lines().collect();
+        let total_lines = lines.len();
 
-        if let Some(tab) = self.tab_manager.get_active_tab_mut() {
-            let lines: Vec<&str> = tab.content.lines().collect();
-            let total_lines = lines.len();
-
-            match direction {
-                CursorDirection::Up => {
-                    if tab.cursor_line > 0 {
-                        tab.cursor_line -= 1;
-                        let line_len = if tab.cursor_line < lines.len() {
-                            lines[tab.cursor_line].len()
-                        } else {
-                            0
-                        };
-                        tab.cursor_col = tab.cursor_col.min(line_len);
-                    }
-                }
-                CursorDirection::Down => {
-                    if tab.cursor_line < lines.len().saturating_sub(1) {
-                        tab.cursor_line += 1;
-                        let line_len = if tab.cursor_line < lines.len() {
-                            lines[tab.cursor_line].len()
-                        } else {
-                            0
-                        };
-                        tab.cursor_col = tab.cursor_col.min(line_len);
-                    }
-                }
-                CursorDirection::Left => {
-                    if tab.cursor_col > 0 {
-                        tab.cursor_col -= 1;
-                    } else if tab.cursor_line > 0 {
-                        tab.cursor_line -= 1;
-                        tab.cursor_col = if tab.cursor_line < lines.len() {
-                            lines[tab.cursor_line].len()
-                        } else {
-                            0
-                        };
-                    }
-                }
-                CursorDirection::Right => {
-                    let current_line_len = if tab.cursor_line < lines.len() {
-                        lines[tab.cursor_line].len()
+        match direction {
+            CursorDirection::Up => {
+                if self.cursor_line > 0 {
+                    self.cursor_line -= 1;
+                    let line_len = if self.cursor_line < lines.len() {
+                        lines[self.cursor_line].len()
                     } else {
                         0
                     };
-
-                    if tab.cursor_col < current_line_len {
-                        tab.cursor_col += 1;
-                    } else if tab.cursor_line < lines.len().saturating_sub(1) {
-                        tab.cursor_line += 1;
-                        tab.cursor_col = 0;
-                    }
+                    self.cursor_col = self.cursor_col.min(line_len);
                 }
             }
-
-            // Auto-scroll to keep cursor visible
-            let visible_lines = 30;
-
-            if tab.cursor_line >= tab.scroll_offset + visible_lines {
-                tab.scroll_offset = tab.cursor_line.saturating_sub(visible_lines - 1);
-            } else if tab.cursor_line < tab.scroll_offset {
-                tab.scroll_offset = tab.cursor_line;
+            CursorDirection::Down => {
+                if self.cursor_line < lines.len().saturating_sub(1) {
+                    self.cursor_line += 1;
+                    let line_len = if self.cursor_line < lines.len() {
+                        lines[self.cursor_line].len()
+                    } else {
+                        0
+                    };
+                    self.cursor_col = self.cursor_col.min(line_len);
+                }
             }
+            CursorDirection::Left => {
+                if self.cursor_col > 0 {
+                    self.cursor_col -= 1;
+                    self.cursor_position -= 1;
+                } else if self.cursor_line > 0 {
+                    self.cursor_line -= 1;
+                    self.cursor_col = if self.cursor_line < lines.len() {
+                        lines[self.cursor_line].len()
+                    } else {
+                        0
+                    };
+                    self.cursor_position -= 1;
+                }
+            }
+            CursorDirection::Right => {
+                let current_line_len = if self.cursor_line < lines.len() {
+                    lines[self.cursor_line].len()
+                } else {
+                    0
+                };
 
-            // Ensure we don't scroll past the end of file
-            let max_scroll = total_lines.saturating_sub(visible_lines);
-            tab.scroll_offset = tab.scroll_offset.min(max_scroll);
+                if self.cursor_col < current_line_len {
+                    self.cursor_col += 1;
+                    self.cursor_position += 1;
+                } else if self.cursor_line < lines.len().saturating_sub(1) {
+                    self.cursor_line += 1;
+                    self.cursor_col = 0;
+                    self.cursor_position += 1;
+                }
+            }
         }
+
+        // Recalculate cursor position for Up/Down movements
+        if matches!(direction, CursorDirection::Up | CursorDirection::Down) {
+            let mut pos = 0;
+            for i in 0..self.cursor_line.min(lines.len()) {
+                pos += lines[i].len() + 1; // +1 for newline
+            }
+            pos += self.cursor_col;
+            self.cursor_position = pos.min(self.file_content.len());
+        }
+
+        // Auto-scroll to keep cursor visible
+        let visible_lines = 30;
+
+        if self.cursor_line >= self.file_content_scroll + visible_lines {
+            self.file_content_scroll = self.cursor_line.saturating_sub(visible_lines - 1);
+        } else if self.cursor_line < self.file_content_scroll {
+            self.file_content_scroll = self.cursor_line;
+        }
+
+        // Ensure we don't scroll past the end of file
+        let max_scroll = total_lines.saturating_sub(visible_lines);
+        self.file_content_scroll = self.file_content_scroll.min(max_scroll);
     }
 
     fn revert_changes(&mut self) {
-        if let Some(tab) = self.tab_manager.get_active_tab_mut() {
-            tab.revert_changes();
-        }
+        self.file_content = self.original_file_content.clone();
+        self.file_has_unsaved_changes = false;
+        self.cursor_position = 0;
+        self.cursor_line = 0;
+        self.cursor_col = 0;
+        self.file_content_scroll = 0;
         self.search_mode = false;
         self.search_query.clear();
         self.search_matches.clear();
@@ -871,10 +838,10 @@ impl App {
     }
 
     fn discard_changes(&mut self) {
-        if let Some(tab) = self.tab_manager.get_active_tab_mut() {
-            tab.revert_changes();
-        }
-        self.tab_manager.cancel_close_tab();
+        self.file_content = self.original_file_content.clone();
+        self.file_has_unsaved_changes = false;
+        self.show_unsaved_alert = false;
+        self.actually_close_file();
     }
 
     fn toggle_search(&mut self) {
@@ -892,21 +859,18 @@ impl App {
             return;
         }
 
-        if let Some(tab) = self.tab_manager.get_active_tab() {
-            let lines: Vec<&str> = tab.content.lines().collect();
-            for (line_idx, line) in lines.iter().enumerate() {
-                let mut start = 0;
-                while let Some(pos) = line[start..].find(&self.search_query) {
-                    self.search_matches.push(SearchMatch {
-                        line: line_idx,
-                        col: start + pos,
-                        text: self.search_query.clone(),
-                    });
-                    start += pos + 1;
-                }
+        let lines: Vec<&str> = self.file_content.lines().collect();
+        for (line_idx, line) in lines.iter().enumerate() {
+            let mut start = 0;
+            while let Some(pos) = line[start..].find(&self.search_query) {
+                self.search_matches.push(SearchMatch {
+                    line: line_idx,
+                    col: start + pos,
+                    text: self.search_query.clone(),
+                });
+                start += pos + 1;
             }
         }
-
         self.current_search_match = 0;
     }
 
@@ -1023,242 +987,19 @@ impl App {
         self.file_finder_selected = 0;
     }
 
-    fn toggle_command_palette(&mut self) {
-        self.command_palette_mode = !self.command_palette_mode;
-        if self.command_palette_mode {
-            self.populate_command_palette();
-        } else {
-            self.command_palette_query.clear();
-            self.command_palette_selected = 0;
-        }
-    }
-
-    fn populate_command_palette(&mut self) {
-        self.command_palette_results = vec![
-            "Open File".to_string(),
-            "New Tab".to_string(),
-            "Close Tab".to_string(),
-            "Close All Tabs".to_string(),
-            "Save".to_string(),
-            "Save All".to_string(),
-            "Show File Tree".to_string(),
-            "Show Terminal".to_string(),
-            "Toggle Hidden Files".to_string(),
-            "Refresh".to_string(),
-            "Go to Parent Directory".to_string(),
-            "Exit".to_string(),
-        ];
-        self.filter_command_results();
-    }
-
-    fn filter_command_results(&mut self) {
-        if self.command_palette_query.is_empty() {
-            self.populate_command_palette();
-            return;
-        }
-
-        let query = self.command_palette_query.to_lowercase();
-        let all_commands = vec![
-            "Open File".to_string(),
-            "New Tab".to_string(),
-            "Close Tab".to_string(),
-            "Close All Tabs".to_string(),
-            "Save".to_string(),
-            "Save All".to_string(),
-            "Show File Tree".to_string(),
-            "Show Terminal".to_string(),
-            "Toggle Hidden Files".to_string(),
-            "Refresh".to_string(),
-            "Go to Parent Directory".to_string(),
-            "Exit".to_string(),
-        ];
-
-        self.command_palette_results = all_commands
-            .into_iter()
-            .filter(|cmd| cmd.to_lowercase().contains(&query))
-            .collect();
-        self.command_palette_selected = 0;
-    }
-
-    fn execute_command(&mut self) -> AppResult<()> {
-        if self.command_palette_selected < self.command_palette_results.len() {
-            let command = &self.command_palette_results[self.command_palette_selected];
-            match command.as_str() {
-                "Open File" => {
-                    self.command_palette_mode = false;
-                    self.toggle_file_finder();
-                }
-                "New Tab" => {
-                    self.command_palette_mode = false;
-                    self.toggle_file_finder();
-                }
-                "Close Tab" => {
-                    self.command_palette_mode = false;
-                    if self.tab_manager.has_tabs() {
-                        let _ = self.tab_manager.close_active_tab();
-                    }
-                }
-                "Close All Tabs" => {
-                    self.command_palette_mode = false;
-                    while self.tab_manager.has_tabs() {
-                        let _ = self.tab_manager.force_close_tab(0);
-                    }
-                }
-                "Save" => {
-                    self.command_palette_mode = false;
-                    self.save_file()?;
-                }
-                "Save All" => {
-                    self.command_palette_mode = false;
-                    let saved_files = self.tab_manager.save_all_tabs();
-                    for (path, content) in saved_files {
-                        let _ = fs::write(&path, &content);
-                    }
-                }
-                "Show File Tree" => {
-                    self.command_palette_mode = false;
-                    self.toggle_file_tree();
-                }
-                "Show Terminal" => {
-                    self.command_palette_mode = false;
-                    self.show_terminal = !self.show_terminal;
-                }
-                "Toggle Hidden Files" => {
-                    self.command_palette_mode = false;
-                    self.show_hidden = !self.show_hidden;
-                    self.refresh_files()?;
-                }
-                "Refresh" => {
-                    self.command_palette_mode = false;
-                    self.refresh_files()?;
-                }
-                "Go to Parent Directory" => {
-                    self.command_palette_mode = false;
-                    if let Some(parent) = self.current_path.parent() {
-                        self.current_path = parent.to_path_buf();
-                        self.refresh_files()?;
-                    }
-                }
-                "Exit" => {
-                    self.command_palette_mode = false;
-                    // Exit will be handled by the main loop
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn toggle_file_tree(&mut self) {
-        self.file_tree_mode = !self.file_tree_mode;
-        if self.file_tree_mode {
-            self.build_file_tree();
-        } else {
-            self.file_tree_expanded.clear();
-            self.file_tree_selected = 0;
-            self.file_tree_items.clear();
-        }
-    }
-
-    fn build_file_tree(&mut self) {
-        self.file_tree_items.clear();
-        self.file_tree_selected = 0;
-        self.build_tree_recursive(&self.current_path.clone(), 0);
-    }
-
-    fn build_tree_recursive(&mut self, path: &PathBuf, depth: usize) {
-        if let Ok(entries) = fs::read_dir(path) {
-            let mut items: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-            items.sort_by(|a, b| {
-                let a_is_dir = a.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                let b_is_dir = b.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-                match (a_is_dir, b_is_dir) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => a.file_name().cmp(&b.file_name()),
-                }
-            });
-
-            for entry in items {
-                let entry_path = entry.path();
-                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-
-                // Skip hidden files unless show_hidden is true
-                if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with('.') && !self.show_hidden {
-                        continue;
-                    }
-                }
-
-                self.file_tree_items
-                    .push((entry_path.clone(), is_dir, depth));
-
-                // If it's a directory and it's expanded, recurse
-                if is_dir && self.file_tree_expanded.contains(&entry_path) {
-                    self.build_tree_recursive(&entry_path, depth + 1);
-                }
-            }
-        }
-    }
-
-    fn toggle_tree_expand(&mut self) {
-        if self.file_tree_selected < self.file_tree_items.len() {
-            let (path, is_dir, _) = &self.file_tree_items[self.file_tree_selected].clone();
-            if *is_dir {
-                if self.file_tree_expanded.contains(path) {
-                    self.file_tree_expanded.retain(|p| p != path);
-                } else {
-                    self.file_tree_expanded.push(path.clone());
-                }
-                self.build_file_tree();
-            }
-        }
-    }
-
-    fn open_selected_tree_item(&mut self) -> AppResult<()> {
-        if self.file_tree_selected < self.file_tree_items.len() {
-            let (path, is_dir, _) = &self.file_tree_items[self.file_tree_selected].clone();
-
-            if *is_dir {
-                // Navigate to directory
-                self.current_path = path.clone();
-                self.file_tree_mode = false;
-                self.refresh_files()?;
-            } else if self.is_text_file_path(path) {
-                // Open file as tab
-                match fs::read_to_string(path) {
-                    Ok(content) => {
-                        let file_name = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("Untitled")
-                            .to_string();
-
-                        self.tab_manager.add_tab(file_name, path.clone(), content);
-                        self.file_tree_mode = false;
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn open_selected_file(&mut self) -> AppResult<()> {
         if self.file_finder_selected < self.file_finder_results.len() {
             let file_path = &self.file_finder_results[self.file_finder_selected];
             if self.is_text_file_path(file_path) {
                 match fs::read_to_string(file_path) {
                     Ok(content) => {
-                        // Open as new tab instead of replacing file content
-                        let file_name = file_path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("Untitled")
-                            .to_string();
-
-                        self.tab_manager
-                            .add_tab(file_name, file_path.clone(), content);
+                        self.file_content = content.clone();
+                        self.original_file_content = content;
+                        self.show_file_content = true;
+                        self.file_content_scroll = 0;
+                        self.file_editing_mode = false;
+                        self.file_has_unsaved_changes = false;
+                        self.update_cursor_position();
                         self.file_finder_mode = false;
                         self.file_finder_query.clear();
                     }
@@ -1371,21 +1112,17 @@ impl App {
     }
 
     fn scroll_file_up(&mut self) {
-        if let Some(tab) = self.tab_manager.get_active_tab_mut() {
-            if tab.scroll_offset > 0 {
-                tab.scroll_offset -= 1;
-            }
+        if self.file_content_scroll > 0 {
+            self.file_content_scroll -= 1;
         }
     }
 
     fn scroll_file_down(&mut self) {
-        if let Some(tab) = self.tab_manager.get_active_tab_mut() {
-            let total_lines = tab.content.lines().count();
-            let visible_lines = 30;
-            let max_scroll = total_lines.saturating_sub(visible_lines);
-            if tab.scroll_offset < max_scroll {
-                tab.scroll_offset += 1;
-            }
+        let lines_count = self.file_content.lines().count();
+        let max_visible = 30;
+        let max_scroll = lines_count.saturating_sub(max_visible);
+        if self.file_content_scroll < max_scroll {
+            self.file_content_scroll += 1;
         }
     }
 
@@ -1713,121 +1450,115 @@ impl App {
 
             if let Some(ref mut lsp) = self.lsp_client {
                 let uri = format!("file://{}", path.to_string_lossy());
-                if let Some(tab) = self.tab_manager.get_active_tab() {
-                    let content = &tab.content;
-                    lsp.did_open(&uri, "go", content).await?;
-                }
+                let content = &self.file_content;
+                lsp.did_open(&uri, "go", content).await?;
+                self.current_file_path = Some(path.clone());
+                self.current_file_version = 1;
             }
         }
         Ok(())
     }
 
     async fn update_file_with_lsp(&mut self) -> AppResult<()> {
-        if let Some(tab) = self.tab_manager.get_active_tab_mut() {
-            if LspClient::is_go_file(&tab.path) {
-                if let Some(ref mut lsp) = self.lsp_client {
-                    let uri = format!("file://{}", tab.path.to_string_lossy());
-                    tab.file_version += 1;
-                    lsp.did_change(&uri, tab.file_version, &tab.content).await?;
-                }
+        if let (Some(lsp), Some(path)) = (&mut self.lsp_client, &self.current_file_path) {
+            if LspClient::is_go_file(path) {
+                let uri = format!("file://{}", path.to_string_lossy());
+                self.current_file_version += 1;
+                lsp.did_change(&uri, self.current_file_version, &self.file_content)
+                    .await?;
             }
         }
         Ok(())
     }
 
     async fn request_completions(&mut self) -> AppResult<()> {
-        if let Some(tab) = self.tab_manager.get_active_tab() {
-            if LspClient::is_go_file(&tab.path) {
-                if let Some(ref mut lsp) = self.lsp_client {
-                    let uri = format!("file://{}", tab.path.to_string_lossy());
-                    lsp.completion(&uri, tab.cursor_line as u32, tab.cursor_col as u32)
-                        .await?;
+        if let (Some(lsp), Some(path)) = (&mut self.lsp_client, &self.current_file_path) {
+            if LspClient::is_go_file(path) {
+                let uri = format!("file://{}", path.to_string_lossy());
+                lsp.completion(&uri, self.cursor_line as u32, self.cursor_col as u32)
+                    .await?;
 
-                    // In a real implementation, you'd need to handle the LSP response
-                    // For now, we'll add some context-aware mock completions
-                    let lines: Vec<&str> = tab.content.lines().collect();
-                    let current_line = if tab.cursor_line < lines.len() {
-                        lines[tab.cursor_line]
+                // In a real implementation, you'd need to handle the LSP response
+                // For now, we'll add some context-aware mock completions
+                let lines: Vec<&str> = self.file_content.lines().collect();
+                let current_line = if self.cursor_line < lines.len() {
+                    lines[self.cursor_line]
+                } else {
+                    ""
+                };
+                let before_cursor = &current_line[..self.cursor_col.min(current_line.len())];
+
+                if let Ok(mut completions) = lsp.completions.lock() {
+                    completions.clear();
+
+                    // Context-specific completions
+                    if before_cursor.ends_with("fmt.") {
+                        completions.push(CompletionCandidate {
+                            label: "Println".to_string(),
+                            detail: Some("func(a ...interface{}) (n int, err error)".to_string()),
+                            kind: Some("Function".to_string()),
+                            insert_text: Some("Println(".to_string()),
+                        });
+                        completions.push(CompletionCandidate {
+                            label: "Printf".to_string(),
+                            detail: Some(
+                                "func(format string, a ...interface{}) (n int, err error)"
+                                    .to_string(),
+                            ),
+                            kind: Some("Function".to_string()),
+                            insert_text: Some("Printf(".to_string()),
+                        });
+                        completions.push(CompletionCandidate {
+                            label: "Sprintf".to_string(),
+                            detail: Some(
+                                "func(format string, a ...interface{}) string".to_string(),
+                            ),
+                            kind: Some("Function".to_string()),
+                            insert_text: Some("Sprintf(".to_string()),
+                        });
+                    } else if before_cursor.ends_with("strings.") {
+                        completions.push(CompletionCandidate {
+                            label: "ToLower".to_string(),
+                            detail: Some("func(s string) string".to_string()),
+                            kind: Some("Function".to_string()),
+                            insert_text: Some("ToLower(".to_string()),
+                        });
+                        completions.push(CompletionCandidate {
+                            label: "ToUpper".to_string(),
+                            detail: Some("func(s string) string".to_string()),
+                            kind: Some("Function".to_string()),
+                            insert_text: Some("ToUpper(".to_string()),
+                        });
+                        completions.push(CompletionCandidate {
+                            label: "Contains".to_string(),
+                            detail: Some("func(s, substr string) bool".to_string()),
+                            kind: Some("Function".to_string()),
+                            insert_text: Some("Contains(".to_string()),
+                        });
                     } else {
-                        ""
-                    };
-
-                    let prefix = &current_line[..tab.cursor_col.min(current_line.len())];
-
-                    if let Ok(mut completions) = lsp.completions.lock() {
-                        completions.clear();
-
-                        // Context-specific completions
-                        if prefix.ends_with("fmt.") {
-                            completions.push(CompletionCandidate {
-                                label: "Println".to_string(),
-                                detail: Some(
-                                    "func(a ...interface{}) (n int, err error)".to_string(),
-                                ),
-                                kind: Some("Function".to_string()),
-                                insert_text: Some("Println(".to_string()),
-                            });
-                            completions.push(CompletionCandidate {
-                                label: "Printf".to_string(),
-                                detail: Some(
-                                    "func(format string, a ...interface{}) (n int, err error)"
-                                        .to_string(),
-                                ),
-                                kind: Some("Function".to_string()),
-                                insert_text: Some("Printf(".to_string()),
-                            });
-                            completions.push(CompletionCandidate {
-                                label: "Sprintf".to_string(),
-                                detail: Some(
-                                    "func(format string, a ...interface{}) string".to_string(),
-                                ),
-                                kind: Some("Function".to_string()),
-                                insert_text: Some("Sprintf(".to_string()),
-                            });
-                        } else if prefix.ends_with("strings.") {
-                            completions.push(CompletionCandidate {
-                                label: "ToLower".to_string(),
-                                detail: Some("func(s string) string".to_string()),
-                                kind: Some("Function".to_string()),
-                                insert_text: Some("ToLower(".to_string()),
-                            });
-                            completions.push(CompletionCandidate {
-                                label: "ToUpper".to_string(),
-                                detail: Some("func(s string) string".to_string()),
-                                kind: Some("Function".to_string()),
-                                insert_text: Some("ToUpper(".to_string()),
-                            });
-                            completions.push(CompletionCandidate {
-                                label: "Contains".to_string(),
-                                detail: Some("func(s, substr string) bool".to_string()),
-                                kind: Some("Function".to_string()),
-                                insert_text: Some("Contains(".to_string()),
-                            });
-                        } else {
-                            // General Go keywords and common patterns
-                            completions.push(CompletionCandidate {
-                                label: "func".to_string(),
-                                detail: Some("Function declaration".to_string()),
-                                kind: Some("Keyword".to_string()),
-                                insert_text: Some("func ".to_string()),
-                            });
-                            completions.push(CompletionCandidate {
-                                label: "if".to_string(),
-                                detail: Some("Conditional statement".to_string()),
-                                kind: Some("Keyword".to_string()),
-                                insert_text: Some("if ".to_string()),
-                            });
-                            completions.push(CompletionCandidate {
-                                label: "for".to_string(),
-                                detail: Some("Loop statement".to_string()),
-                                kind: Some("Keyword".to_string()),
-                                insert_text: Some("for ".to_string()),
-                            });
-                        }
+                        // General Go keywords and common patterns
+                        completions.push(CompletionCandidate {
+                            label: "func".to_string(),
+                            detail: Some("Function declaration".to_string()),
+                            kind: Some("Keyword".to_string()),
+                            insert_text: Some("func ".to_string()),
+                        });
+                        completions.push(CompletionCandidate {
+                            label: "if".to_string(),
+                            detail: Some("Conditional statement".to_string()),
+                            kind: Some("Keyword".to_string()),
+                            insert_text: Some("if ".to_string()),
+                        });
+                        completions.push(CompletionCandidate {
+                            label: "for".to_string(),
+                            detail: Some("Loop statement".to_string()),
+                            kind: Some("Keyword".to_string()),
+                            insert_text: Some("for ".to_string()),
+                        });
                     }
-
-                    self.completions = lsp.completions.lock().unwrap().clone();
                 }
+
+                self.completions = lsp.completions.lock().unwrap().clone();
             }
         }
         Ok(())
@@ -1891,34 +1622,29 @@ impl App {
         }
 
         // Only trigger autocomplete if LSP is ready and we're in a Go file
-        if let Some(tab) = self.tab_manager.get_active_tab() {
-            if LspClient::is_go_file(&tab.path) {
-                if let Some(ref lsp) = self.lsp_client {
-                    if lsp.status == LspStatus::Running {
-                        // Check if cursor is after a potential completion trigger
-                        let lines: Vec<&str> = tab.content.lines().collect();
-                        if tab.cursor_line < lines.len() {
-                            let current_line = lines[tab.cursor_line];
-                            let before_cursor =
-                                &current_line[..tab.cursor_col.min(current_line.len())];
+        if let (Some(lsp), Some(path)) = (&self.lsp_client, &self.current_file_path) {
+            if LspClient::is_go_file(path) && lsp.status == LspStatus::Running {
+                // Check if cursor is after a potential completion trigger
+                let lines: Vec<&str> = self.file_content.lines().collect();
+                if self.cursor_line < lines.len() {
+                    let current_line = lines[self.cursor_line];
+                    let before_cursor = &current_line[..self.cursor_col.min(current_line.len())];
 
-                            // Check for various completion triggers
-                            let should_trigger =
-                                // After a dot (package.function)
-                                before_cursor.ends_with('.') ||
-                                // After typing at least 2 characters of an identifier
-                                (before_cursor.len() >= 2 &&
-                                 before_cursor.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').count() >= 2) ||
-                                // Inside function call context
-                                (before_cursor.contains('(') && !before_cursor.contains(')'));
+                    // Check for various completion triggers
+                    let should_trigger =
+                        // After a dot (package.function)
+                        before_cursor.ends_with('.') ||
+                        // After typing at least 2 characters of an identifier
+                        (before_cursor.len() >= 2 &&
+                         before_cursor.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').count() >= 2) ||
+                        // Inside function call context
+                        (before_cursor.contains('(') && !before_cursor.contains(')'));
 
-                            if should_trigger {
-                                self.last_completion_trigger = now;
-                                self.request_completions().await?;
-                                if !self.completions.is_empty() {
-                                    self.show_autocomplete();
-                                }
-                            }
+                    if should_trigger {
+                        self.last_completion_trigger = now;
+                        self.request_completions().await?;
+                        if !self.completions.is_empty() {
+                            self.show_autocomplete();
                         }
                     }
                 }
@@ -1969,57 +1695,32 @@ fn format_permissions(metadata: &Metadata) -> String {
 fn ui(f: &mut Frame, app: &mut App) {
     let size = f.size();
 
-    // Create main layout - adjust based on whether tabs are open and terminal visibility
-    let chunks = if app.tab_manager.has_tabs() {
-        if app.show_terminal {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),  // Header
-                    Constraint::Length(3),  // Tabs
-                    Constraint::Min(0),     // File content
-                    Constraint::Length(12), // Terminal
-                    Constraint::Length(3),  // Footer
-                ])
-                .split(size)
-        } else {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3), // Header
-                    Constraint::Length(3), // Tabs
-                    Constraint::Min(0),    // File content
-                    Constraint::Length(3), // Footer
-                ])
-                .split(size)
-        }
+    // Create main layout - adjust based on terminal visibility
+    let chunks = if app.show_terminal {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),  // Header
+                Constraint::Min(0),     // File list
+                Constraint::Length(12), // Terminal
+                Constraint::Length(3),  // Footer
+            ])
+            .split(size)
     } else {
-        if app.show_terminal {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),  // Header
-                    Constraint::Min(0),     // File list
-                    Constraint::Length(12), // Terminal
-                    Constraint::Length(3),  // Footer
-                ])
-                .split(size)
-        } else {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3), // Header
-                    Constraint::Min(0),    // File list
-                    Constraint::Length(3), // Footer
-                ])
-                .split(size)
-        }
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Header
+                Constraint::Min(0),    // File list
+                Constraint::Length(3), // Footer
+            ])
+            .split(size)
     };
 
     // Header with LSP status for Go files
-    let header_text = if app.tab_manager.has_tabs() {
-        if let Some(tab) = app.tab_manager.get_active_tab() {
-            if LspClient::is_go_file(&tab.path) {
+    let header_text = if app.file_editing_mode {
+        if let Some(ref path) = app.current_file_path {
+            if LspClient::is_go_file(path) {
                 let lsp_indicator = if let Some(ref lsp) = app.lsp_client {
                     match lsp.status {
                         LspStatus::Running => "🟢 LSP",
@@ -2031,17 +1732,12 @@ fn ui(f: &mut Frame, app: &mut App) {
                     "⚪ LSP"
                 };
                 format!(
-                    "📁 {} | 🐹 Go {} Ready | {}",
+                    "📁 {} | 🐹 Go {} Ready",
                     app.current_path.display(),
-                    lsp_indicator,
-                    app.tab_manager.get_tabs_info()
+                    lsp_indicator
                 )
             } else {
-                format!(
-                    "📁 {} | {}",
-                    app.current_path.display(),
-                    app.tab_manager.get_tabs_info()
-                )
+                format!("📁 {}", app.current_path.display())
             }
         } else {
             format!("📁 {}", app.current_path.display())
@@ -2055,194 +1751,51 @@ fn ui(f: &mut Frame, app: &mut App) {
         .style(Style::default().fg(Color::Cyan));
     f.render_widget(header, chunks[0]);
 
-    if app.tab_manager.has_tabs() {
-        // Render tabs
-        app.tab_manager.render_tabs(f, chunks[1]);
+    // File list
+    let items: Vec<ListItem> = app
+        .files
+        .iter()
+        .map(|file| {
+            let icon = file.get_icon();
+            let size_str = FileItem::format_size(file.size, app.human_readable);
+            let date_str = file.format_date();
 
-        // Render active tab content
-        if let Some(tab) = app.tab_manager.get_active_tab() {
-            let content_area = chunks[2];
-            let content_lines: Vec<&str> = tab.content.lines().collect();
-            let total_lines = content_lines.len();
-            let max_visible = (content_area.height as usize).saturating_sub(2); // Account for borders
-
-            // Calculate visible lines
-            let visible_lines = content_lines
-                .iter()
-                .skip(tab.scroll_offset)
-                .take(max_visible);
-
-            // Prepare syntax highlighting
-            let syntax = app
-                .syntax_set
-                .find_syntax_for_file(&tab.path)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| app.syntax_set.find_syntax_plain_text());
-
-            let theme = &app.theme_set.themes["base16-ocean.dark"];
-            let mut highlighter = HighlightLines::new(syntax, theme);
-
-            let mut lines: Vec<Line> = Vec::new();
-            let line_number_width = total_lines.to_string().len().max(3);
-
-            for (line_idx, line_text) in visible_lines.enumerate() {
-                let actual_line_idx = line_idx + tab.scroll_offset;
-                let line_number = actual_line_idx + 1;
-
-                // Create line number span
-                let line_num_str = format!("{:width$} ", line_number, width = line_number_width);
-                let line_num_span =
-                    Span::styled(line_num_str, Style::default().fg(Color::DarkGray));
-
-                let mut spans = vec![line_num_span];
-
-                if actual_line_idx == tab.cursor_line {
-                    // This line contains the cursor - highlight background
-                    match highlighter.highlight_line(line_text, &app.syntax_set) {
-                        Ok(highlighted) => {
-                            let line_chars: Vec<char> = line_text.chars().collect();
-                            let mut char_idx = 0;
-
-                            for (style, text) in highlighted {
-                                let fg_color = style.foreground;
-                                let color = Color::Rgb(fg_color.r, fg_color.g, fg_color.b);
-                                let mut modifier = Modifier::empty();
-                                if style
-                                    .font_style
-                                    .contains(syntect::highlighting::FontStyle::BOLD)
-                                {
-                                    modifier |= Modifier::BOLD;
-                                }
-
-                                for ch in text.chars() {
-                                    if char_idx == tab.cursor_col && app.cursor_blink_state {
-                                        // Insert cursor before this character
-                                        spans.push(Span::styled(
-                                            "█",
-                                            Style::default().fg(Color::White).bg(Color::DarkGray),
-                                        ));
-                                    }
-
-                                    spans.push(Span::styled(
-                                        ch.to_string(),
-                                        Style::default()
-                                            .fg(color)
-                                            .add_modifier(modifier)
-                                            .bg(Color::DarkGray),
-                                    ));
-                                    char_idx += 1;
-                                }
-                            }
-
-                            // If cursor is at end of line
-                            if tab.cursor_col >= line_chars.len() && app.cursor_blink_state {
-                                spans.push(Span::styled(
-                                    "█",
-                                    Style::default().fg(Color::White).bg(Color::DarkGray),
-                                ));
-                            }
-                        }
-                        Err(_) => {
-                            spans.push(Span::styled(
-                                *line_text,
-                                Style::default().bg(Color::DarkGray),
-                            ));
-                        }
-                    }
-                } else {
-                    // Regular line with syntax highlighting
-                    match highlighter.highlight_line(line_text, &app.syntax_set) {
-                        Ok(highlighted) => {
-                            for (style, text) in highlighted {
-                                let fg_color = style.foreground;
-                                let color = Color::Rgb(fg_color.r, fg_color.g, fg_color.b);
-                                let mut modifier = Modifier::empty();
-                                if style
-                                    .font_style
-                                    .contains(syntect::highlighting::FontStyle::BOLD)
-                                {
-                                    modifier |= Modifier::BOLD;
-                                }
-                                spans.push(Span::styled(
-                                    text,
-                                    Style::default().fg(color).add_modifier(modifier),
-                                ));
-                            }
-                        }
-                        Err(_) => {
-                            spans.push(Span::raw(*line_text));
-                        }
-                    }
-                }
-
-                lines.push(Line::from(spans));
-            }
-
-            let edit_title = if tab.has_unsaved_changes {
-                format!(" {} (EDITING - UNSAVED) ", tab.name)
+            let style = if file.is_dir {
+                Style::default().fg(Color::Blue)
+            } else if app.is_text_file(file) {
+                Style::default().fg(Color::Green)
             } else {
-                format!(" {} (EDITING) ", tab.name)
+                Style::default().fg(Color::White)
             };
 
-            let content_paragraph = Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .title(edit_title)
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Green)),
-                )
-                .wrap(Wrap { trim: false });
+            let content = format!(
+                "{} {:30} {:>10} {} {}",
+                icon, file.name, size_str, file.permissions, date_str
+            );
+            ListItem::new(content).style(style)
+        })
+        .collect();
 
-            f.render_widget(content_paragraph, content_area);
-        }
-    } else {
-        // File list (when no tabs are open)
-        let items: Vec<ListItem> = app
-            .files
-            .iter()
-            .map(|file| {
-                let icon = file.get_icon();
-                let size_str = FileItem::format_size(file.size, app.human_readable);
-                let date_str = file.format_date();
+    let files_list = List::new(items)
+        .block(Block::default().borders(Borders::ALL))
+        .highlight_style(Style::default().bg(Color::Yellow).fg(Color::Black))
+        .highlight_symbol("➤ ");
 
-                let style = if file.is_dir {
-                    Style::default().fg(Color::Blue)
-                } else if app.is_text_file(file) {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default().fg(Color::White)
-                };
+    f.render_stateful_widget(files_list, chunks[1], &mut app.list_state);
 
-                let content = format!(
-                    "{} {:30} {:>10} {} {}",
-                    icon, file.name, size_str, file.permissions, date_str
-                );
-                ListItem::new(content).style(style)
-            })
-            .collect();
-
-        let files_list = List::new(items)
-            .block(Block::default().borders(Borders::ALL))
-            .highlight_style(Style::default().bg(Color::Yellow).fg(Color::Black))
-            .highlight_symbol("➤ ");
-
-        f.render_stateful_widget(files_list, chunks[1], &mut app.list_state);
-
-        // Scrollbar
-        let scrollbar = Scrollbar::default()
-            .orientation(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("↑"))
-            .end_symbol(Some("↓"));
-        f.render_stateful_widget(
-            scrollbar,
-            chunks[1].inner(&Margin {
-                vertical: 1,
-                horizontal: 1,
-            }),
-            &mut app.scroll_state,
-        );
-    }
+    // Scrollbar
+    let scrollbar = Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("↑"))
+        .end_symbol(Some("↓"));
+    f.render_stateful_widget(
+        scrollbar,
+        chunks[1].inner(&Margin {
+            vertical: 1,
+            horizontal: 1,
+        }),
+        &mut app.scroll_state,
+    );
 
     // Terminal (if enabled, show in its own section)
     if app.show_terminal {
@@ -2302,68 +1855,51 @@ fn ui(f: &mut Frame, app: &mut App) {
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(Color::White));
 
-        let terminal_chunk = if app.tab_manager.has_tabs() {
-            chunks[3]
-        } else {
-            chunks[2]
-        };
-        f.render_widget(terminal_paragraph, terminal_chunk);
+        f.render_widget(terminal_paragraph, chunks[2]);
     }
 
     // Footer
     let footer_text = if app.show_help {
-        "Help: ↑↓/jk=Navigate  Enter=Open  a=Toggle hidden  h=Help  Ctrl+T=Terminal  Ctrl+P=Command Palette  q/Esc=Quit  Ctrl+Q=Force quit"
+        "Help: ↑↓/jk=Navigate  Enter=Open  a=Toggle hidden  h=Help  Ctrl+T=Terminal  q/Esc=Quit  Ctrl+Q=Force quit"
     } else if app.show_terminal {
         "Terminal active - Type commands and press Enter  |  Ctrl+T to close  |  Esc to quit  |  Ctrl+Q force quit"
-    } else if app.tab_manager.has_tabs() {
-        if let Some(tab) = app.tab_manager.get_active_tab() {
-            if LspClient::is_go_file(&tab.path) {
-                if app.show_lsp_status {
-                    &app.lsp_status_message
-                } else if app.lsp_client.is_some() {
-                    if let Some(ref lsp) = app.lsp_client {
-                        match lsp.status {
-                            LspStatus::Running => {
-                                "Tab editing - 🟢 LSP ready - Ctrl+Space autocomplete | Ctrl+W close | Ctrl+Tab switch"
-                            }
-                            LspStatus::Failed(_) => {
-                                "Tab editing - 🔴 LSP failed - Ctrl+W close | Ctrl+Tab switch"
-                            }
-                            _ => {
-                                "Tab editing - 🟡 LSP starting... | Ctrl+W close | Ctrl+Tab switch"
-                            }
-                        }
-                    } else {
-                        "Tab editing - Ctrl+Space start LSP | Ctrl+W close | Ctrl+Tab switch"
+    } else if app.file_editing_mode
+        && app
+            .current_file_path
+            .as_ref()
+            .map(|p| LspClient::is_go_file(p))
+            .unwrap_or(false)
+    {
+        if app.show_lsp_status {
+            &app.lsp_status_message
+        } else if app.lsp_client.is_some() {
+            if let Some(ref lsp) = app.lsp_client {
+                match lsp.status {
+                    LspStatus::Running => {
+                        "Go file editing - 🟢 LSP ready - Ctrl+Space for autocomplete"
                     }
-                } else {
-                    "Tab editing - Ctrl+Space start LSP | Ctrl+W close | Ctrl+Tab switch"
+                    LspStatus::Failed(_) => {
+                        "Go file editing - 🔴 LSP failed - Press Ctrl+Space for details"
+                    }
+                    _ => "Go file editing - 🟡 LSP starting...",
                 }
             } else {
-                "Tab editing - Ctrl+S save | Ctrl+W close | Ctrl+Tab switch | ↑↓←→ navigate"
+                "Go file editing - Press Ctrl+Space to start LSP"
             }
         } else {
-            "Press 'h' for help  |  ↑↓ Navigate  Enter Open  Ctrl+O File Finder  Ctrl+P Command Palette  Ctrl+T Terminal  Esc Quit  Ctrl+Q Force quit"
+            "Go file editing - Press Ctrl+Space to start LSP"
         }
     } else {
-        "Press 'h' for help  |  ↑↓ Navigate  Enter Open  Ctrl+O File Finder  Ctrl+P Command Palette  Ctrl+T Terminal  Esc Quit  Ctrl+Q Force quit"
+        "Press 'h' for help  |  ↑↓ Navigate  Enter Open  Ctrl+T Terminal  Esc Quit  Ctrl+Q Force quit"
     };
     let footer = Paragraph::new(footer_text)
         .block(Block::default().borders(Borders::ALL))
         .style(Style::default().fg(Color::Gray));
 
     let footer_chunk = if app.show_terminal {
-        if app.tab_manager.has_tabs() {
-            chunks[4]
-        } else {
-            chunks[3]
-        }
+        chunks[3]
     } else {
-        if app.tab_manager.has_tabs() {
-            chunks[3]
-        } else {
-            chunks[2]
-        }
+        chunks[2]
     };
     f.render_widget(footer, footer_chunk);
 
@@ -2397,8 +1933,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             Line::from("  Edit mode: Backspace to delete, Ctrl+Z to revert"),
             Line::from("  Ctrl+F to search, F3/Shift+F3 for next/prev"),
             Line::from("  Ctrl+O for file finder, Ctrl+D for multi-cursor"),
-            Line::from("  Ctrl+W to close tab, Ctrl+Tab to switch tabs"),
-            Line::from("  Press Esc to close file view or go back to browser"),
+            Line::from("  Press Esc to close file view"),
             Line::from(""),
             Line::from("Terminal:"),
             Line::from("  Opens at bottom of screen"),
@@ -2424,12 +1959,8 @@ fn ui(f: &mut Frame, app: &mut App) {
         f.render_widget(help_popup, popup_area);
     }
 
-    // Tab close confirmation popup
-    app.tab_manager.render_close_confirmation(f, size);
-
-    // File content popup (legacy - replaced by tabs)
-    if false {
-        // Disabled since we now use tabs
+    // File content popup
+    if app.show_file_content {
         let popup_area = centered_rect(85, 85, size);
         f.render_widget(Clear, popup_area);
 
@@ -3019,60 +2550,6 @@ fn ui(f: &mut Frame, app: &mut App) {
         );
     }
 
-    // File tree modal
-    if app.file_tree_mode {
-        let tree_area = centered_rect(70, 80, size);
-        f.render_widget(Clear, tree_area);
-
-        let items: Vec<ListItem> = app
-            .file_tree_items
-            .iter()
-            .enumerate()
-            .map(|(i, (path, is_dir, depth))| {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                let indent = "  ".repeat(*depth);
-                let icon = if *is_dir {
-                    if app.file_tree_expanded.contains(path) {
-                        "📂"
-                    } else {
-                        "📁"
-                    }
-                } else {
-                    "📄"
-                };
-
-                let style = if i == app.file_tree_selected {
-                    Style::default().bg(Color::Blue).fg(Color::White)
-                } else {
-                    Style::default()
-                };
-
-                ListItem::new(format!("{}{} {}", indent, icon, name)).style(style)
-            })
-            .collect();
-
-        let tree_list = List::new(items).block(
-            Block::default()
-                .title(" File Tree ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
-        );
-
-        f.render_widget(tree_list, tree_area);
-
-        let help_area = ratatui::layout::Rect {
-            x: tree_area.x + 2,
-            y: tree_area.y + tree_area.height - 2,
-            width: tree_area.width - 4,
-            height: 1,
-        };
-        f.render_widget(
-            Paragraph::new("↑↓ navigate, Enter open/navigate, Space expand/collapse, Esc close")
-                .style(Style::default().fg(Color::Gray)),
-            help_area,
-        );
-    }
-
     // Delete confirmation dialog
     if app.show_delete_confirmation {
         let confirm_area = centered_rect(50, 25, size);
@@ -3142,618 +2619,393 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> AppResult<()
 
         // Use poll to check for events with timeout for cursor blinking
         if poll(std::time::Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    match key.code {
-                        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            // Force exit - bypasses all modals and dialogs
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Force exit - bypasses all modals and dialogs
+                        return Ok(());
+                    }
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        if app.show_delete_confirmation {
+                            app.cancel_delete();
+                        } else if app.show_unsaved_alert {
+                            app.show_unsaved_alert = false;
+                        } else if app.show_completions {
+                            app.hide_autocomplete();
+                        } else if app.show_lsp_status {
+                            app.show_lsp_status = false;
+                        } else if app.show_terminal {
+                            app.toggle_terminal()?;
+                        } else if app.show_file_content {
+                            app.close_file();
+                        } else if app.show_help {
+                            app.toggle_help();
+                        } else {
                             return Ok(());
                         }
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            if app.tab_manager.show_close_confirmation {
-                                app.tab_manager.cancel_close_tab();
-                            } else if app.show_delete_confirmation {
-                                app.cancel_delete();
-                            } else if app.command_palette_mode {
-                                app.toggle_command_palette();
-                            } else if app.file_finder_mode {
-                                app.toggle_file_finder();
-                            } else if app.file_tree_mode {
-                                app.toggle_file_tree();
-                            } else if app.show_completions {
-                                app.hide_autocomplete();
-                            } else if app.show_lsp_status {
-                                app.show_lsp_status = false;
-                            } else if app.show_terminal {
-                                app.toggle_terminal()?;
-                            } else if app.tab_manager.has_tabs() {
-                                app.close_file();
-                            } else if app.show_help {
-                                app.toggle_help();
+                    }
+                    KeyCode::Up if app.show_completions => {
+                        app.select_completion(-1);
+                    }
+                    KeyCode::Down if app.show_completions => {
+                        app.select_completion(1);
+                    }
+                    KeyCode::Up => {
+                        if app.show_unsaved_alert {
+                            // Don't navigate when alert is shown
+                        } else if app.show_terminal {
+                            // In terminal mode, don't handle up/down
+                        } else if app.show_file_content && app.file_editing_mode {
+                            app.handle_cursor_movement(CursorDirection::Up);
+                        } else if app.show_file_content && !app.file_editing_mode {
+                            app.scroll_file_up();
+                        } else if !app.show_help && !app.show_file_content {
+                            app.navigate_up();
+                        }
+                    }
+                    KeyCode::Down => {
+                        if app.show_unsaved_alert {
+                            // Don't navigate when alert is shown
+                        } else if app.show_terminal {
+                            // In terminal mode, don't handle up/down
+                        } else if app.show_file_content && app.file_editing_mode {
+                            app.handle_cursor_movement(CursorDirection::Down);
+                        } else if app.show_file_content && !app.file_editing_mode {
+                            app.scroll_file_down();
+                        } else if !app.show_help && !app.show_file_content {
+                            app.navigate_down();
+                        }
+                    }
+                    KeyCode::Char('k') => {
+                        if app.show_unsaved_alert {
+                            // Don't navigate when alert is shown
+                        } else if app.show_terminal {
+                            app.handle_terminal_input('k')?;
+                        } else if app.file_editing_mode {
+                            // In edit mode, 'k' should be typed as a character
+                            app.handle_file_edit('k');
+                            // Trigger autocomplete for Go files
+                            if let Some(ref path) = app.current_file_path.clone() {
+                                if LspClient::is_go_file(path) {
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    let _ = rt.block_on(app.update_file_with_lsp());
+                                    let _ = rt.block_on(app.maybe_trigger_autocomplete());
+                                }
+                            }
+                        } else if !app.show_help && !app.show_file_content {
+                            // Only use 'k' for navigation when not in edit mode
+                            app.navigate_up();
+                        }
+                    }
+                    KeyCode::Char('j') => {
+                        if app.show_unsaved_alert {
+                            // Don't navigate when alert is shown
+                        } else if app.show_terminal {
+                            app.handle_terminal_input('j')?;
+                        } else if app.file_editing_mode {
+                            // In edit mode, 'j' should be typed as a character
+                            app.handle_file_edit('j');
+                            // Trigger autocomplete for Go files
+                            if let Some(ref path) = app.current_file_path.clone() {
+                                if LspClient::is_go_file(path) {
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    let _ = rt.block_on(app.update_file_with_lsp());
+                                    let _ = rt.block_on(app.maybe_trigger_autocomplete());
+                                }
+                            }
+                        } else if !app.show_help && !app.show_file_content {
+                            // Only use 'j' for navigation when not in edit mode
+                            app.navigate_down();
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if app.show_unsaved_alert {
+                            // Don't handle enter when alert is shown
+                        } else if app.show_terminal {
+                            app.handle_terminal_input('\n')?;
+                        } else if app.file_editing_mode {
+                            app.handle_file_edit('\n');
+                        } else if !app.show_help && !app.show_file_content {
+                            if app.file_has_unsaved_changes {
+                                app.show_unsaved_alert = true;
                             } else {
-                                return Ok(());
+                                app.enter_directory()?;
                             }
                         }
-                        KeyCode::Up if app.show_completions => {
-                            app.select_completion(-1);
+                    }
+                    KeyCode::Left => {
+                        if app.file_editing_mode && !app.show_unsaved_alert {
+                            app.handle_cursor_movement(CursorDirection::Left);
                         }
-                        KeyCode::Down if app.show_completions => {
-                            app.select_completion(1);
+                    }
+                    KeyCode::Right => {
+                        if app.file_editing_mode && !app.show_unsaved_alert {
+                            app.handle_cursor_movement(CursorDirection::Right);
                         }
+                    }
+                    KeyCode::Char('a') => {
+                        if app.show_unsaved_alert {
+                            // Don't handle 'a' when alert is shown
+                        } else if app.show_terminal {
+                            app.handle_terminal_input('a')?;
+                        } else if app.file_editing_mode {
+                            app.handle_file_edit('a');
+                        } else if !app.show_help && !app.show_file_content {
+                            app.toggle_hidden()?;
+                        }
+                    }
+                    KeyCode::Char('h') => {
+                        if app.show_unsaved_alert {
+                            // Don't handle 'h' when alert is shown
+                        } else if app.show_terminal {
+                            app.handle_terminal_input('h')?;
+                        } else if app.file_editing_mode {
+                            app.handle_file_edit('h');
+                        } else if !app.show_file_content {
+                            app.toggle_help();
+                        }
+                    }
+                    KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.show_file_content && !app.show_unsaved_alert {
+                            app.toggle_search();
+                        }
+                    }
+                    KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if !app.show_unsaved_alert && !app.show_file_content {
+                            app.toggle_file_finder();
+                        }
+                    }
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.show_file_content && app.file_editing_mode && !app.show_unsaved_alert
+                        {
+                            app.toggle_multi_cursor();
+                        }
+                    }
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if !app.show_unsaved_alert {
+                            app.toggle_terminal()?;
+                        }
+                    }
+                    KeyCode::Tab => {
+                        if app.show_completions {
+                            app.apply_completion();
+                        } else if app.file_editing_mode && !app.show_unsaved_alert {
+                            app.handle_file_edit('\t');
+                        }
+                    }
+                    KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.file_editing_mode && !app.show_unsaved_alert {
+                            if let Some(ref path) = app.current_file_path.clone() {
+                                if LspClient::is_go_file(path) {
+                                    // Show status and trigger autocomplete for Go files
+                                    if app.lsp_client.is_none() {
+                                        let rt = tokio::runtime::Runtime::new().unwrap();
+                                        let _ = rt.block_on(app.start_lsp_for_go());
+                                    }
+
+                                    if let Some(ref lsp) = app.lsp_client {
+                                        if lsp.status == LspStatus::Running {
+                                            let rt = tokio::runtime::Runtime::new().unwrap();
+                                            let _ = rt.block_on(app.request_completions());
+                                            app.show_autocomplete();
+                                        } else {
+                                            // Show current LSP status
+                                            match &lsp.status {
+                                                LspStatus::Failed(err) => {
+                                                    if err.contains("not found") {
+                                                        app.lsp_status_message = "❌ gopls not installed - Run: go install golang.org/x/tools/gopls@latest".to_string();
+                                                    } else {
+                                                        app.lsp_status_message =
+                                                            format!("❌ LSP Error: {}", err);
+                                                    }
+                                                }
+                                                LspStatus::Starting => {
+                                                    app.lsp_status_message =
+                                                        "🟡 Starting Go LSP server...".to_string();
+                                                }
+                                                _ => {
+                                                    app.lsp_status_message = "❌ Go LSP not ready - Check gopls installation".to_string();
+                                                }
+                                            }
+                                            app.show_lsp_status = true;
+                                        }
+                                    } else {
+                                        app.lsp_status_message =
+                                            "🟡 Starting Go LSP for first time...".to_string();
+                                        app.show_lsp_status = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::F(3) => {
+                        if app.search_mode {
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                app.previous_search_match();
+                            } else {
+                                app.next_search_match();
+                            }
+                        }
+                    }
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.show_file_content && app.file_editing_mode {
+                            app.save_file()?;
+                        } else if app.show_unsaved_alert {
+                            app.save_file()?;
+                            app.actually_close_file();
+                        }
+                    }
+                    KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.show_file_content && app.file_editing_mode {
+                            app.revert_changes();
+                        }
+                    }
+                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.show_file_content && !app.show_unsaved_alert {
+                            app.toggle_edit_mode();
+                        }
+                    }
+
+                    KeyCode::Char('d') => {
+                        if app.show_unsaved_alert {
+                            app.discard_changes();
+                        } else if app.file_editing_mode {
+                            app.hide_autocomplete();
+                            app.handle_file_edit('d');
+                        }
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.show_unsaved_alert {
+                            // Don't quit when alert is shown
+                        } else if app.show_terminal {
+                            let _ = app.send_to_terminal("\u{3}"); // Send Ctrl+C to terminal
+                        } else {
+                            return Ok(());
+                        }
+                    }
+
+                    KeyCode::Backspace => {
+                        if app.show_unsaved_alert {
+                            // Don't handle backspace when alert is shown
+                        } else if app.show_terminal {
+                            app.handle_terminal_input('\u{8}')?;
+                        } else if app.file_editing_mode {
+                            app.hide_autocomplete();
+                            app.handle_file_edit('\u{8}');
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        if app.show_unsaved_alert {
+                            match c {
+                                's' => {
+                                    app.save_file()?;
+                                    app.actually_close_file();
+                                }
+                                'd' => {
+                                    app.discard_changes();
+                                }
+                                'r' => {
+                                    app.revert_changes();
+                                    app.actually_close_file();
+                                }
+                                'c' => {
+                                    app.show_unsaved_alert = false;
+                                }
+                                _ => {}
+                            }
+                        } else if app.search_mode {
+                            if c == '\n' || c == '\r' {
+                                app.search_in_content();
+                                if !app.search_matches.is_empty() {
+                                    app.next_search_match();
+                                }
+                            } else if c == '\u{8}' || c == '\u{7f}' {
+                                app.search_query.pop();
+                                app.search_in_content();
+                            } else if !c.is_control() {
+                                app.search_query.push(c);
+                                app.search_in_content();
+                            }
+                        } else if app.file_finder_mode {
+                            if c == '\n' || c == '\r' {
+                                app.open_selected_file()?;
+                            } else if c == '\u{8}' || c == '\u{7f}' {
+                                if !app.file_finder_query.is_empty() {
+                                    app.file_finder_query.pop();
+                                    app.filter_file_results();
+                                }
+                            } else if !c.is_control() {
+                                app.file_finder_query.push(c);
+                                app.filter_file_results();
+                            }
+                        } else if app.show_delete_confirmation {
+                            match c {
+                                'y' | 'Y' => {
+                                    app.delete_confirmed_file()?;
+                                }
+                                'n' | 'N' => {
+                                    app.cancel_delete();
+                                }
+                                _ => {}
+                            }
+                        } else if app.show_terminal {
+                            app.handle_terminal_input(c)?;
+                        } else if app.file_editing_mode {
+                            if c == '\n'
+                                && app.multi_cursor_mode
+                                && key.modifiers.contains(KeyModifiers::ALT)
+                            {
+                                app.add_cursor_at_position();
+                            } else {
+                                // Determine if this character should trigger or hide autocomplete
+                                let is_trigger_char = c == '.' || c.is_alphabetic() || c == '_';
+                                let is_completion_killer =
+                                    c.is_whitespace() || "(){}[];,".contains(c);
+
+                                if app.show_completions && is_completion_killer {
+                                    app.hide_autocomplete();
+                                }
+
+                                app.handle_file_edit(c);
+
+                                // Update LSP and trigger autocomplete for Go files
+                                if let Some(ref path) = app.current_file_path.clone() {
+                                    if LspClient::is_go_file(path) {
+                                        let rt = tokio::runtime::Runtime::new().unwrap();
+                                        let _ = rt.block_on(app.update_file_with_lsp());
+
+                                        // Auto-trigger autocomplete on trigger characters or when typing
+                                        if is_trigger_char || c.is_alphabetic() {
+                                            let _ = rt.block_on(app.maybe_trigger_autocomplete());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Don't handle other characters when not in terminal or edit mode
+                        // This prevents accidental exits
+                    }
+                    // Handle file finder navigation
+                    _ if app.file_finder_mode => match key.code {
                         KeyCode::Up => {
-                            if app.tab_manager.show_close_confirmation {
-                                // Don't navigate when confirmation is shown
-                            } else if app.show_terminal {
-                                // In terminal mode, don't handle up/down
-                            } else if app.tab_manager.has_tabs() {
-                                app.handle_cursor_movement(CursorDirection::Up);
-                            } else if !app.show_help {
-                                app.navigate_up();
+                            if app.file_finder_selected > 0 {
+                                app.file_finder_selected -= 1;
                             }
                         }
                         KeyCode::Down => {
-                            if app.tab_manager.show_close_confirmation {
-                                // Don't navigate when confirmation is shown
-                            } else if app.show_terminal {
-                                // In terminal mode, don't handle up/down
-                            } else if app.tab_manager.has_tabs() {
-                                app.handle_cursor_movement(CursorDirection::Down);
-                            } else if !app.show_help {
-                                app.navigate_down();
-                            }
-                        }
-                        KeyCode::Char('k') => {
-                            if app.tab_manager.show_close_confirmation {
-                                // Don't navigate when confirmation is shown
-                            } else if app.show_terminal {
-                                app.handle_terminal_input('k')?;
-                            } else if app.tab_manager.has_tabs() {
-                                // In tab editing mode, 'k' should be typed as a character
-                                app.handle_file_edit('k');
-                                // Trigger autocomplete for Go files
-                                if let Some(tab) = app.tab_manager.get_active_tab() {
-                                    let path = tab.path.clone();
-                                    if LspClient::is_go_file(&path) {
-                                        let rt = tokio::runtime::Runtime::new().unwrap();
-                                        let _ = rt.block_on(app.update_file_with_lsp());
-                                        let _ = rt.block_on(app.maybe_trigger_autocomplete());
-                                    }
-                                }
-                            } else if !app.show_help {
-                                // Only use 'k' for navigation when not in edit mode
-                                app.navigate_up();
-                            }
-                        }
-                        KeyCode::Char('j') => {
-                            if app.tab_manager.show_close_confirmation {
-                                // Don't navigate when confirmation is shown
-                            } else if app.show_terminal {
-                                app.handle_terminal_input('j')?;
-                            } else if app.tab_manager.has_tabs() {
-                                // In tab editing mode, 'j' should be typed as a character
-                                app.handle_file_edit('j');
-                                // Trigger autocomplete for Go files
-                                if let Some(tab) = app.tab_manager.get_active_tab() {
-                                    let path = tab.path.clone();
-                                    if LspClient::is_go_file(&path) {
-                                        let rt = tokio::runtime::Runtime::new().unwrap();
-                                        let _ = rt.block_on(app.update_file_with_lsp());
-                                        let _ = rt.block_on(app.maybe_trigger_autocomplete());
-                                    }
-                                }
-                            } else if !app.show_help {
-                                // Only use 'j' for navigation when not in edit mode
-                                app.navigate_down();
-                            }
-                        }
-                        KeyCode::Enter => {
-                            if app.show_unsaved_alert {
-                                // Don't handle enter when alert is shown
-                            } else if app.show_terminal {
-                                app.handle_terminal_input('\n')?;
-                            } else if app.file_editing_mode {
-                                app.handle_file_edit('\n');
-                            } else if !app.show_help && !app.show_file_content {
-                                if app.file_has_unsaved_changes {
-                                    app.show_unsaved_alert = true;
-                                } else {
-                                    app.enter_directory()?;
-                                }
-                            }
-                        }
-                        KeyCode::Left => {
-                            if app.tab_manager.has_tabs()
-                                && !app.tab_manager.show_close_confirmation
+                            if app.file_finder_selected
+                                < app.file_finder_results.len().saturating_sub(1)
                             {
-                                app.handle_cursor_movement(CursorDirection::Left);
+                                app.file_finder_selected += 1;
                             }
                         }
-                        KeyCode::Right => {
-                            if app.tab_manager.has_tabs()
-                                && !app.tab_manager.show_close_confirmation
-                            {
-                                app.handle_cursor_movement(CursorDirection::Right);
-                            }
+                        KeyCode::Delete => {
+                            app.confirm_delete_file();
                         }
-                        KeyCode::Char('a') => {
-                            if app.tab_manager.show_close_confirmation {
-                                // Don't handle 'a' when confirmation is shown
-                            } else if app.show_terminal {
-                                app.handle_terminal_input('a')?;
-                            } else if app.tab_manager.has_tabs() {
-                                app.handle_file_edit('a');
-                            } else if !app.show_help {
-                                app.toggle_hidden()?;
-                            }
-                        }
-                        KeyCode::Char('h') => {
-                            if app.tab_manager.show_close_confirmation {
-                                // Don't handle 'h' when confirmation is shown
-                            } else if app.show_terminal {
-                                app.handle_terminal_input('h')?;
-                            } else if app.tab_manager.has_tabs() {
-                                app.handle_file_edit('h');
-                            } else {
-                                app.toggle_help();
-                            }
-                        }
-                        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if app.tab_manager.has_tabs()
-                                && !app.tab_manager.show_close_confirmation
-                            {
-                                app.toggle_search();
-                            }
-                        }
-                        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if !app.tab_manager.show_close_confirmation
-                                && !app.tab_manager.has_tabs()
-                            {
-                                app.toggle_file_finder();
-                            }
-                        }
-                        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if !app.tab_manager.show_close_confirmation {
-                                app.toggle_command_palette();
-                            }
-                        }
-                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if app.tab_manager.has_tabs()
-                                && !app.tab_manager.show_close_confirmation
-                            {
-                                app.toggle_multi_cursor();
-                            }
-                        }
-                        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if !app.tab_manager.show_close_confirmation {
-                                app.toggle_terminal()?;
-                            }
-                        }
-                        KeyCode::Tab => {
-                            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                // Ctrl+Tab: Switch to next tab
-                                app.tab_manager.next_tab();
-                            } else if app.show_completions {
-                                app.apply_completion();
-                            } else if app.tab_manager.has_tabs() {
-                                app.handle_file_edit('\t');
-                            }
-                        }
-                        KeyCode::BackTab => {
-                            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                // Ctrl+Shift+Tab: Switch to previous tab
-                                app.tab_manager.previous_tab();
-                            }
-                        }
-                        KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if app.tab_manager.has_tabs()
-                                && !app.tab_manager.show_close_confirmation
-                            {
-                                if let Some(tab) = app.tab_manager.get_active_tab() {
-                                    let path = tab.path.clone();
-                                    if LspClient::is_go_file(&path) {
-                                        // Show status and trigger autocomplete for Go files
-                                        if app.lsp_client.is_none() {
-                                            let rt = tokio::runtime::Runtime::new().unwrap();
-                                            let _ = rt.block_on(app.start_lsp_for_go());
-                                        }
-
-                                        if let Some(ref lsp) = app.lsp_client {
-                                            if lsp.status == LspStatus::Running {
-                                                let rt = tokio::runtime::Runtime::new().unwrap();
-                                                let _ = rt.block_on(app.request_completions());
-                                                app.show_autocomplete();
-                                            } else {
-                                                // Show current LSP status
-                                                match &lsp.status {
-                                                    LspStatus::Failed(err) => {
-                                                        if err.contains("not found") {
-                                                            app.lsp_status_message = "❌ gopls not installed - Run: go install golang.org/x/tools/gopls@latest".to_string();
-                                                        } else {
-                                                            app.lsp_status_message =
-                                                                format!("❌ LSP Error: {}", err);
-                                                        }
-                                                    }
-                                                    LspStatus::Starting => {
-                                                        app.lsp_status_message =
-                                                            "🟡 Starting Go LSP server..."
-                                                                .to_string();
-                                                    }
-                                                    _ => {
-                                                        app.lsp_status_message = "❌ Go LSP not ready - Check gopls installation".to_string();
-                                                    }
-                                                }
-                                                app.show_lsp_status = true;
-                                            }
-                                        } else {
-                                            app.lsp_status_message =
-                                                "🟡 Starting Go LSP for first time...".to_string();
-                                            app.show_lsp_status = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        KeyCode::F(3) => {
-                            if app.search_mode {
-                                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                    app.previous_search_match();
-                                } else {
-                                    app.next_search_match();
-                                }
-                            }
-                        }
-                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if app.show_file_content && app.file_editing_mode {
-                                app.save_file()?;
-                            } else if app.show_unsaved_alert {
-                                app.save_file()?;
-                                app.actually_close_file();
-                            }
-                        }
-                        KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if app.tab_manager.has_tabs() {
-                                app.revert_changes();
-                            }
-                        }
-                        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if app.tab_manager.has_tabs() {
-                                app.close_file();
-                            }
-                        }
-                        KeyCode::Char('y') => {
-                            if app.tab_manager.show_close_confirmation {
-                                app.tab_manager.confirm_close_tab();
-                            }
-                        }
-                        KeyCode::Char('n') => {
-                            if app.tab_manager.show_close_confirmation {
-                                app.tab_manager.cancel_close_tab();
-                            }
-                        }
-                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            // Edit mode toggle removed since tabs are always in edit mode
-                        }
-
-                        KeyCode::Char('d') => {
-                            if app.tab_manager.show_close_confirmation {
-                                // 'd' doesn't do anything in close confirmation
-                            } else if app.tab_manager.has_tabs() {
-                                app.hide_autocomplete();
-                                app.handle_file_edit('d');
-                            }
-                        }
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if app.tab_manager.show_close_confirmation {
-                                // Don't quit when confirmation is shown
-                            } else if app.show_terminal {
-                                let _ = app.send_to_terminal("\u{3}"); // Send Ctrl+C to terminal
-                            } else {
-                                return Ok(());
-                            }
-                        }
-
-                        KeyCode::Backspace => {
-                            if app.tab_manager.show_close_confirmation {
-                                // Don't handle backspace when confirmation is shown
-                            } else if app.show_terminal {
-                                app.handle_terminal_input('\u{8}')?;
-                            } else if app.tab_manager.has_tabs() {
-                                app.hide_autocomplete();
-                                app.handle_file_edit('\u{8}');
-                            }
-                        }
-                        KeyCode::Char(c) => {
-                            if app.search_mode {
-                                if c == '\n' || c == '\r' {
-                                    app.search_in_content();
-                                    if !app.search_matches.is_empty() {
-                                        app.next_search_match();
-                                    }
-                                } else if c == '\u{8}' || c == '\u{7f}' {
-                                    app.search_query.pop();
-                                    app.search_in_content();
-                                } else if !c.is_control() {
-                                    app.search_query.push(c);
-                                    app.search_in_content();
-                                }
-                            } else if app.file_finder_mode {
-                                if c == '\n' || c == '\r' {
-                                    app.open_selected_file()?;
-                                } else if c == '\u{8}' || c == '\u{7f}' {
-                                    if !app.file_finder_query.is_empty() {
-                                        app.file_finder_query.pop();
-                                        app.filter_file_results();
-                                    }
-                                } else if !c.is_control() {
-                                    app.file_finder_query.push(c);
-                                    app.filter_file_results();
-                                }
-                            } else if app.command_palette_mode {
-                                if c == '\n' || c == '\r' {
-                                    app.execute_command()?;
-                                } else if c == '\u{8}' || c == '\u{7f}' {
-                                    if !app.command_palette_query.is_empty() {
-                                        app.command_palette_query.pop();
-                                        app.filter_command_results();
-                                    }
-                                } else if !c.is_control() {
-                                    app.command_palette_query.push(c);
-                                    app.filter_command_results();
-                                }
-                            } else if app.show_delete_confirmation {
-                                match c {
-                                    'y' | 'Y' => {
-                                        app.delete_confirmed_file()?;
-                                    }
-                                    'n' | 'N' => {
-                                        app.cancel_delete();
-                                    }
-                                    _ => {}
-                                }
-                            } else if app.show_terminal {
-                                app.handle_terminal_input(c)?;
-                            } else if app.tab_manager.has_tabs() {
-                                if c == '\n'
-                                    && app.multi_cursor_mode
-                                    && key.modifiers.contains(KeyModifiers::ALT)
-                                {
-                                    app.add_cursor_at_position();
-                                } else {
-                                    // Determine if this character should trigger or hide autocomplete
-                                    let is_trigger_char = c == '.' || c.is_alphabetic() || c == '_';
-                                    let is_completion_killer =
-                                        c.is_whitespace() || "(){}[];,".contains(c);
-
-                                    if app.show_completions && is_completion_killer {
-                                        app.hide_autocomplete();
-                                    }
-
-                                    app.handle_file_edit(c);
-
-                                    // Update LSP and trigger autocomplete for Go files
-                                    if let Some(tab) = app.tab_manager.get_active_tab() {
-                                        if LspClient::is_go_file(&tab.path) {
-                                            let rt = tokio::runtime::Runtime::new().unwrap();
-                                            let _ = rt.block_on(app.update_file_with_lsp());
-
-                                            // Auto-trigger autocomplete on trigger characters or when typing
-                                            if is_trigger_char || c.is_alphabetic() {
-                                                let _ =
-                                                    rt.block_on(app.maybe_trigger_autocomplete());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            // Don't handle other characters when not in terminal or edit mode
-                            // This prevents accidental exits
-                        }
-                        // Handle file finder navigation
-                        _ if app.file_finder_mode => match key.code {
-                            KeyCode::Up => {
-                                if app.file_finder_selected > 0 {
-                                    app.file_finder_selected -= 1;
-                                }
-                            }
-                            KeyCode::Down => {
-                                if app.file_finder_selected
-                                    < app.file_finder_results.len().saturating_sub(1)
-                                {
-                                    app.file_finder_selected += 1;
-                                }
-                            }
-                            KeyCode::Delete => {
-                                app.confirm_delete_file();
-                            }
-                            _ => {}
-                        },
-                        _ if app.file_tree_mode => match key.code {
-                            KeyCode::Up => {
-                                if app.file_tree_selected > 0 {
-                                    app.file_tree_selected -= 1;
-                                }
-                            }
-                            KeyCode::Down => {
-                                if app.file_tree_selected
-                                    < app.file_tree_items.len().saturating_sub(1)
-                                {
-                                    app.file_tree_selected += 1;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                app.open_selected_tree_item()?;
-                            }
-                            KeyCode::Char(' ') => {
-                                app.toggle_tree_expand();
-                            }
-                            _ => {}
-                        },
-                        _ if app.command_palette_mode => match key.code {
-                            KeyCode::Up => {
-                                if app.command_palette_selected > 0 {
-                                    app.command_palette_selected -= 1;
-                                }
-                            }
-                            KeyCode::Down => {
-                                if app.command_palette_selected
-                                    < app.command_palette_results.len().saturating_sub(1)
-                                {
-                                    app.command_palette_selected += 1;
-                                }
-                            }
-                            _ => {}
-                        },
                         _ => {}
-                    }
+                    },
+                    _ => {}
                 }
-                Event::Mouse(mouse) => {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => {
-                            if app.tab_manager.has_tabs()
-                                && !app.tab_manager.show_close_confirmation
-                            {
-                                // Calculate the editor area bounds (same as centered_rect(85, 85, terminal_size))
-                                let terminal_size = terminal.size().unwrap_or_default();
-                                let popup_area = centered_rect(85, 85, terminal_size);
-
-                                // Check if mouse is within the editor area
-                                if mouse.column >= popup_area.x
-                                    && mouse.column < popup_area.x + popup_area.width
-                                    && mouse.row >= popup_area.y
-                                    && mouse.row < popup_area.y + popup_area.height
-                                {
-                                    // In tab edit mode, scroll up by moving cursor up (single line for precision)
-                                    app.handle_cursor_movement(CursorDirection::Up);
-                                }
-                            } else if !app.show_help
-                                && !app.tab_manager.has_tabs()
-                                && !app.file_finder_mode
-                            {
-                                // In file browser, scroll anywhere in the main area
-                                if app.selected_index > 0 {
-                                    app.navigate_up();
-                                }
-                            }
-                        }
-                        MouseEventKind::ScrollDown => {
-                            if app.show_file_content && !app.show_unsaved_alert {
-                                // Calculate the editor area bounds (same as centered_rect(85, 85, terminal_size))
-                                let terminal_size = terminal.size().unwrap_or_default();
-                                let popup_area = centered_rect(85, 85, terminal_size);
-
-                                // Check if mouse is within the editor area
-                                if mouse.column >= popup_area.x
-                                    && mouse.column < popup_area.x + popup_area.width
-                                    && mouse.row >= popup_area.y
-                                    && mouse.row < popup_area.y + popup_area.height
-                                {
-                                    // In tab edit mode, scroll down by moving cursor down (single line for precision)
-                                    app.handle_cursor_movement(CursorDirection::Down);
-                                }
-                            } else if !app.show_help
-                                && !app.tab_manager.has_tabs()
-                                && !app.file_finder_mode
-                            {
-                                // In file browser, scroll anywhere in the main area
-                                if app.selected_index < app.files.len().saturating_sub(1) {
-                                    app.navigate_down();
-                                }
-                            }
-                        }
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            // Check for double-click (within 500ms and same position)
-                            let now = std::time::Instant::now();
-                            let is_double_click =
-                                now.duration_since(app.last_click_time).as_millis() < 500
-                                    && app.last_click_position == (mouse.column, mouse.row);
-
-                            app.last_click_time = now;
-                            app.last_click_position = (mouse.column, mouse.row);
-
-                            if app.tab_manager.has_tabs()
-                                && !app.tab_manager.show_close_confirmation
-                            {
-                                // Handle mouse click in editor - position cursor
-                                let terminal_size = terminal.size().unwrap_or_default();
-                                let popup_area = centered_rect(85, 85, terminal_size);
-
-                                // Check if click is within the editor area
-                                if mouse.column >= popup_area.x
-                                    && mouse.column < popup_area.x + popup_area.width
-                                    && mouse.row >= popup_area.y
-                                    && mouse.row < popup_area.y + popup_area.height
-                                {
-                                    // Calculate relative position within editor
-                                    if let Some(tab) = app.tab_manager.get_active_tab_mut() {
-                                        let relative_row =
-                                            mouse.row.saturating_sub(popup_area.y + 1); // +1 for border
-                                        let relative_col =
-                                            mouse.column.saturating_sub(popup_area.x + 1); // +1 for border
-
-                                        // Calculate target line and column
-                                        let target_line = tab.scroll_offset + relative_row as usize;
-                                        let lines: Vec<&str> = tab.content.lines().collect();
-
-                                        if target_line < lines.len() {
-                                            tab.cursor_line = target_line;
-
-                                            // Account for line numbers in the display
-                                            let line_number_width =
-                                                lines.len().to_string().len().max(3) + 1;
-                                            let actual_col = relative_col
-                                                .saturating_sub(line_number_width as u16)
-                                                as usize;
-                                            let line_len = lines[target_line].chars().count();
-                                            tab.cursor_col = actual_col.min(line_len);
-
-                                            app.update_cursor_position();
-                                        }
-                                    }
-                                }
-                            } else if !app.tab_manager.has_tabs()
-                                && !app.show_help
-                                && !app.file_finder_mode
-                                && !app.show_terminal
-                                && !app.tab_manager.show_close_confirmation
-                            {
-                                // Handle mouse click in file browser - select file
-                                let terminal_size = terminal.size().unwrap_or_default();
-
-                                // Calculate the main content area (excluding terminal if shown)
-                                let main_area_height = if app.show_terminal {
-                                    terminal_size.height.saturating_sub(12) // Reserve space for terminal
-                                } else {
-                                    terminal_size.height.saturating_sub(3) // Reserve space for footer
-                                };
-
-                                // Check if click is in the file list area (roughly)
-                                if mouse.row >= 2 && mouse.row < main_area_height {
-                                    // Calculate which file was clicked based on row
-                                    let clicked_row = mouse.row.saturating_sub(2) as usize;
-
-                                    // Account for scrolling offset if any
-                                    let target_index = clicked_row;
-
-                                    if target_index < app.files.len() {
-                                        // If double-click on same file, open it
-                                        if is_double_click && target_index == app.selected_index {
-                                            let _ = app.enter_directory();
-                                        } else {
-                                            // Single click - just select the file
-                                            app.selected_index = target_index;
-                                            app.list_state.select(Some(app.selected_index));
-                                            app.scroll_state =
-                                                app.scroll_state.position(app.selected_index);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        _ => {}
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -3779,15 +3031,6 @@ fn print_simple_list(app: &App) {
 }
 
 fn main() -> AppResult<()> {
-    // Check for tabs demo flag
-    #[cfg(feature = "tabs-demo")]
-    {
-        if std::env::args().any(|arg| arg == "--tabs-demo") {
-            tabs_demo::demo_tab_features();
-            return Ok(());
-        }
-    }
-
     let args = Args::parse();
 
     // Resolve the path
